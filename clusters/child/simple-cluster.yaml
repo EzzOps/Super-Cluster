@@ -1,0 +1,47 @@
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: simple-docker-cluster
+  namespace: default
+spec:
+  clusterNetwork:
+    pods:
+      cidrBlocks:
+        - 192.168.0.0/16
+    services:
+      cidrBlocks:
+        - 10.96.0.0/12
+  topology:
+    class: quick-start
+    version: v1.29.2
+    controlPlane:
+      replicas: 1
+    workers:
+      machineDeployments:
+        - class: default-worker
+          name: md-0
+          replicas: 1
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: DockerCluster
+metadata:
+  name: simple-docker-cluster
+  namespace: default
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: DockerMachineTemplate
+metadata:
+  name: simple-docker-cluster-control-plane
+  namespace: default
+spec:
+  template:
+    spec: {}
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: DockerMachineTemplate
+metadata:
+  name: simple-docker-cluster-md-0
+  namespace: default
+spec:
+  template:
+    spec: {}

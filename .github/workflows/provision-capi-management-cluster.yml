@@ -1,0 +1,79 @@
+name: Provision ephemeral management cluster on VPS
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/provision-capi-management-cluster.yml'
+      - 'clusters/management/**'
+      - 'clusters/child/**'
+
+jobs:
+  provision-management-cluster:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      HOST: ${{ secrets.HOST }}
+      USER: ${{ secrets.USER }}
+      PASSWORD: ${{ secrets.PASSWORD }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install kubectl and Flux CLI
+        run: |
+          curl -fsSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.29.2/bin/linux/amd64/kubectl
+          chmod +x /usr/local/bin/kubectl
+          curl -s https://fluxcd.io/install.sh | sudo bash
+          kubectl version --client --output=yaml
+          flux --version
+
+      - name: Provision ephemeral management cluster on VPS
+        run: |
+          sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no "${USER}@${HOST}" bash -s <<'REMOTE'
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode=644" sh -
+          systemctl enable --now k3s
+          sleep 10
+          REMOTE
+
+      - name: Retrieve kubeconfig from VPS
+        run: |
+          sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no "${USER}@${HOST}" 'sudo cat /etc/rancher/k3s/k3s.yaml' > /tmp/mgmt-kubeconfig.yaml
+          sed -i "s/127.0.0.1/${HOST}/g" /tmp/mgmt-kubeconfig.yaml
+          chmod 600 /tmp/mgmt-kubeconfig.yaml
+          export KUBECONFIG=/tmp/mgmt-kubeconfig.yaml
+          kubectl get nodes
+
+      - name: Bootstrap Flux on the management cluster
+        run: |
+          export KUBECONFIG=/tmp/mgmt-kubeconfig.yaml
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          flux bootstrap git \
+            --url=https://github.com/${GITHUB_REPOSITORY}.git \
+            --branch="${BRANCH}" \
+            --path=./clusters/management \
+            --silent
+
+      - name: Configure target kubeconfig for Flux
+        run: |
+          export KUBECONFIG=/tmp/mgmt-kubeconfig.yaml
+          mkdir -p /tmp/flux-secrets
+          sshpass -p "$PASSWORD" scp -o StrictHostKeyChecking=no "${USER}@${HOST}:/etc/rancher/k3s/k3s.yaml" /tmp/flux-secrets/contabo-kubeconfig
+          sed -i "s/127.0.0.1/${HOST}/g" /tmp/flux-secrets/contabo-kubeconfig
+          kubectl create secret generic contabo-kubeconfig -n flux-system --from-file=value=/tmp/flux-secrets/contabo-kubeconfig --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Verify Flux reconciliation
+        run: |
+          export KUBECONFIG=/tmp/mgmt-kubeconfig.yaml
+          kubectl wait --for=condition=Available deployment/source-controller -n flux-system --timeout=10m
+          kubectl wait --for=condition=Available deployment/kustomize-controller -n flux-system --timeout=10m
+          kubectl get kustomizations.kustomize.toolkit.fluxcd.io -A
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no "${USER}@${HOST}" 'if command -v k3s >/dev/null 2>&1; then /usr/local/bin/k3s-uninstall.sh || true; fi'
