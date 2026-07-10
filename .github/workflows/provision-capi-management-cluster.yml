@@ -30,6 +30,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Read cluster configuration from repo
+        id: config
+        run: |
+          # Dynamically discover child clusters from repo
+          CHILD_CLUSTERS=$(ls -d clusters/child/*/ 2>/dev/null | xargs -I{} basename {} | tr '\n' ' ')
+          echo "child_clusters=${CHILD_CLUSTERS:-child-1 child-2}" >> $GITHUB_OUTPUT
+          
+          # Read K8s version from child cluster manifests
+          K8S_VERSION=$(grep -h 'version: v' clusters/child/*/cluster.yaml 2>/dev/null | head -1 | awk '{print $2}')
+          echo "k8s_version=${K8S_VERSION:-v1.29.2}" >> $GITHUB_OUTPUT
+          
+          echo "Discovered child clusters: ${CHILD_CLUSTERS:-child-1 child-2}"
+          echo "K8s version: ${K8S_VERSION:-v1.29.2}"
+
       - name: Install tools (sshpass, kubectl, Flux CLI, clusterctl)
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
@@ -58,7 +72,6 @@ jobs:
             curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode=644" sh -
             systemctl enable --now k3s
           fi
-
           for i in $(seq 1 30); do
             if kubectl get nodes --no-headers 2>/dev/null | grep -q Ready; then
               echo "K3s ready after ${i}s"
@@ -101,6 +114,7 @@ jobs:
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
           BRANCH="${GITHUB_REF_NAME:-main}"
+          # Idempotent: flux bootstrap skips if already bootstrapped
           kubectl create namespace flux-system --dry-run=client -o yaml | kubectl apply -f -
           flux bootstrap git \
             --url=https://github.com/${GITHUB_REPOSITORY}.git \
@@ -113,6 +127,7 @@ jobs:
       - name: Install Cluster API with Docker provider (CAPD)
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          # Idempotent: clusterctl init skips if already installed
           echo "Initializing CAPI with Docker provider..."
           clusterctl init --infrastructure docker
           kubectl wait --for=condition=Available deployment/capi-controller-manager -n capi-system --timeout=5m 2>/dev/null || true
@@ -120,31 +135,25 @@ jobs:
           echo "=== CAPI / CAPD pods ==="
           kubectl get pods -A | grep -E "capi|capd|NAME"
 
-      - name: Delete stale CAPI clusters (prepare for fresh manifests)
+      - name: Trigger Flux to reconcile latest manifest changes
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          for child in child-1 child-2; do
-            if kubectl get cluster "$child" -n default --request-timeout=10s &>/dev/null; then
-              echo "Deleting stale cluster $child..."
-              kubectl delete cluster "$child" -n default --timeout=120s --wait=true
-            fi
-          done
-          echo "Stale clusters removed"
-
-      - name: Force Flux to sync latest child cluster manifests
-        run: |
-          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          # Force immediate reconcile (GitRepository already polls every 1m)
           kubectl annotate --overwrite gitrepository/flux-system -n flux-system \
             flux.fluxcd.io/reconcileAt="$(date +%s)"
-          echo "Flux sync triggered. CAPI provisions in background."
+          echo "Flux reconcile triggered."
+          echo "CAPI will create/update child clusters declaratively from repo manifests."
+          echo ""
           sleep 15
-          echo "=== CAPI status ==="
+          echo "=== Current CAPI state ==="
           kubectl get clusters -A -o wide 2>/dev/null || echo "No clusters yet"
+          kubectl get machines -A -o wide 2>/dev/null || echo "No machines yet"
 
-      - name: Try to retrieve child kubeconfigs (if already provisioned)
+      - name: Retrieve child kubeconfigs (if provisioned) and import into Flux
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          for child in child-1 child-2; do
+          CHILD_CLUSTERS="${{ steps.config.outputs.child_clusters }}"
+          for child in $CHILD_CLUSTERS; do
             phase=$(kubectl get cluster "$child" -n default -o jsonpath='{.status.phase}' 2>/dev/null)
             if [ "$phase" = "Provisioned" ]; then
               clusterctl get kubeconfig "$child" -n default > "/tmp/kubeconfigs/$child.yaml" 2>/dev/null || true
@@ -153,11 +162,10 @@ jobs:
                 kubectl create secret generic "kubeconfig-$child" -n flux-system \
                   --from-file=value=/tmp/kubeconfigs/$child.yaml \
                   --dry-run=client -o yaml | kubectl apply -f -
-                echo "Imported kubeconfig for $child"
+                echo "Imported kubeconfig for $child into Flux"
               fi
             else
-              echo "$child not Provisioned yet (phase: ${phase:-none})"
-              echo "  CAPI works in background. Ready next run."
+              echo "Skipping $child - not Provisioned yet (phase: ${phase:-none}). Ready next run."
             fi
           done
 
@@ -166,12 +174,16 @@ jobs:
           echo "========================================"
           echo "  Super-Cluster GitOps pipeline done"
           echo "========================================"
-          echo "  Management: K3s on ${{ secrets.HOST }}:6443"
-          echo "  Flux:       reconciling from repo"
-          echo "  CAPI/CAPD:  installed, provisioning"
-          echo "  Child-1/2:  being created by CAPI"
+          echo "  ! Fully idempotent - safe to re-run"
+          echo "  ! Changes via YAML edits only"
+          echo "  ! Flux + CAPI reconcile loop active"
           echo "========================================"
-          echo "  CAPI provisions Docker containers on"
-          echo "  the VPS in the background. Check the"
-          echo "  next workflow run or SSH to verify."
+          echo "  Management: K3s (CAPI via clusterctl)"
+          echo "  Child clusters (${{ steps.config.outputs.child_clusters }})"
+          echo "  Kubernetes: ${{ steps.config.outputs.k8s_version }}"
+          echo "========================================"
+          echo "  To add a new child cluster:"
+          echo "    1. Create clusters/child/<name>/cluster.yaml"
+          echo "    2. Push to main"
+          echo "    3. Flux + CAPI auto-provisions"
           echo "========================================"
