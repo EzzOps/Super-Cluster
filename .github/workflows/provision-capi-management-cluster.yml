@@ -55,6 +55,7 @@ jobs:
           SSHPASS: ${{ secrets.PASSWORD }}
         run: |
           sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" bash -s <<'REMOTE'
+          export PATH="$PATH:/usr/local/bin"
           set -euo pipefail
           if command -v k3s >/dev/null 2>&1 && systemctl is-active --quiet k3s; then
             echo "K3s management cluster already running"
@@ -79,6 +80,7 @@ jobs:
           SSHPASS: ${{ secrets.PASSWORD }}
         run: |
           sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" bash -s <<'REMOTE'
+          export PATH="$PATH:/usr/local/bin"
           set -euo pipefail
           if ! command -v docker >/dev/null 2>&1; then
             echo "Installing Docker..."
@@ -86,11 +88,12 @@ jobs:
           else
             echo "Docker already installed"
           fi
-          if ! command -v k3d >/dev/null 2>&1; then
-            echo "Installing k3d..."
-            curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          if command -v k3d >/dev/null 2>&1; then
+            echo "k3d already installed at $(which k3d)"
           else
-            echo "k3d already installed"
+            echo "Installing k3d..."
+            rm -f /usr/local/bin/k3d 2>/dev/null || true
+            curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
           fi
           k3d version
           REMOTE
@@ -100,6 +103,7 @@ jobs:
           SSHPASS: ${{ secrets.PASSWORD }}
         run: |
           sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" bash -s <<'REMOTE'
+          export PATH="$PATH:/usr/local/bin"
           set -euo pipefail
           CHILD_CLUSTERS=("child-1" "child-2")
           for cluster in "${CHILD_CLUSTERS[@]}"; do
