@@ -116,6 +116,15 @@ jobs:
           echo "=== CAPI / CAPD pods ==="
           kubectl get pods -A | grep -E "capi|capd|NAME"
 
+      - name: Trigger Flux to sync CAPI Cluster manifests
+        run: |
+          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          kubectl annotate --overwrite gitrepository/flux-system -n flux-system             flux.fluxcd.io/reconcileAt="$(date +%s)"
+          echo "Flux sync triggered, waiting for CAPI Cluster resources..."
+          sleep 20
+          echo "=== CAPI Clusters ==="
+          kubectl get clusters -A
+
       - name: Remove stale CAPI clusters from previous runs
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
@@ -130,15 +139,6 @@ jobs:
           done
           echo "Cleaned up stale CAPI resources"
           kubectl get clusters -A --request-timeout=10s 2>/dev/null || echo "No clusters remaining"
-
-      - name: Trigger Flux to sync CAPI Cluster manifests
-        run: |
-          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          kubectl annotate --overwrite gitrepository/flux-system -n flux-system             flux.fluxcd.io/reconcileAt="$(date +%s)"
-          echo "Flux sync triggered, waiting for CAPI Cluster resources..."
-          sleep 20
-          echo "=== CAPI Clusters ==="
-          kubectl get clusters -A
 
       - name: Wait for child clusters to be Provisioned by CAPI/CAPD
         run: |
