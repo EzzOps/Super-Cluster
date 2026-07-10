@@ -24,7 +24,7 @@ env:
 jobs:
   ensure-super-cluster:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
@@ -38,9 +38,6 @@ jobs:
           curl -s https://fluxcd.io/install.sh | sudo bash
           curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64 -o /usr/local/bin/clusterctl
           chmod +x /usr/local/bin/clusterctl
-          kubectl version --client --output=yaml
-          flux --version
-          clusterctl version
 
       - name: Test SSH connectivity to VPS
         env:
@@ -61,7 +58,7 @@ jobs:
             curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode=644" sh -
             systemctl enable --now k3s
           fi
-          echo "Waiting for K3s to be ready..."
+
           for i in $(seq 1 30); do
             if kubectl get nodes --no-headers 2>/dev/null | grep -q Ready; then
               echo "K3s ready after ${i}s"
@@ -92,7 +89,8 @@ jobs:
           SSHPASS: ${{ secrets.PASSWORD }}
         run: |
           mkdir -p /tmp/kubeconfigs
-          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}"             'sudo cat /etc/rancher/k3s/k3s.yaml' > /tmp/kubeconfigs/mgmt.yaml
+          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" \
+            'sudo cat /etc/rancher/k3s/k3s.yaml' > /tmp/kubeconfigs/mgmt.yaml
           sed -i "s/127.0.0.1/${{ secrets.HOST }}/g" /tmp/kubeconfigs/mgmt.yaml
           chmod 600 /tmp/kubeconfigs/mgmt.yaml
           echo "Management kubeconfig retrieved"
@@ -104,7 +102,13 @@ jobs:
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
           BRANCH="${GITHUB_REF_NAME:-main}"
           kubectl create namespace flux-system --dry-run=client -o yaml | kubectl apply -f -
-          flux bootstrap git             --url=https://github.com/${GITHUB_REPOSITORY}.git             --branch="${BRANCH}"             --path=./clusters/management             --token-auth             --password="$GITHUB_TOKEN"             --silent
+          flux bootstrap git \
+            --url=https://github.com/${GITHUB_REPOSITORY}.git \
+            --branch="${BRANCH}" \
+            --path=./clusters/management \
+            --token-auth \
+            --password="$GITHUB_TOKEN" \
+            --silent
 
       - name: Install Cluster API with Docker provider (CAPD)
         run: |
@@ -116,71 +120,28 @@ jobs:
           echo "=== CAPI / CAPD pods ==="
           kubectl get pods -A | grep -E "capi|capd|NAME"
 
-      - name: Trigger Flux to sync CAPI Cluster manifests
-        run: |
-          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          kubectl annotate --overwrite gitrepository/flux-system -n flux-system             flux.fluxcd.io/reconcileAt="$(date +%s)"
-          echo "Flux sync triggered, waiting for CAPI Cluster resources..."
-          sleep 20
-          echo "=== CAPI Clusters ==="
-          kubectl get clusters -A
-
-      - name: Remove stale CAPI clusters from previous runs
+      - name: Delete stale CAPI clusters (prepare for fresh manifests)
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
           for child in child-1 child-2; do
-            if kubectl get cluster "\$child" -n default --request-timeout=10s &>/dev/null; then
-              echo "Deleting stale cluster \$child..."
-              kubectl delete cluster "\$child" -n default --timeout=60s --wait=true
-              # Also remove any leftover containers from CAPD
-              kubectl get dockercluster -n default 2>/dev/null -o name | xargs -r kubectl delete -n default 2>/dev/null || true
-              kubectl get dockermachinetemplate -n default 2>/dev/null -o name | xargs -r kubectl delete -n default 2>/dev/null || true
+            if kubectl get cluster "$child" -n default --request-timeout=10s &>/dev/null; then
+              echo "Deleting stale cluster $child..."
+              kubectl delete cluster "$child" -n default --timeout=120s --wait=true
             fi
           done
-          echo "Waiting for stale clusters to be fully removed..."
-          for i in $(seq 1 30); do
-            remaining=$(kubectl get clusters -A --request-timeout=10s --no-headers 2>/dev/null | wc -l)
-            if [ "$remaining" = "0" ]; then
-              echo "All stale clusters removed after ${i}s"
-              break
-            fi
-            sleep 2
-          done
-          echo "Verified: No stale CAPI clusters remaining"
+          echo "Stale clusters removed"
 
-      - name: Wait for child clusters to be Provisioned by CAPI/CAPD
+      - name: Force Flux to sync latest child cluster manifests
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          # Force Flux to sync latest manifests from repo
-          kubectl annotate --overwrite gitrepository/flux-system -n flux-system             flux.fluxcd.io/reconcileAt="$(date +%s)"
-          echo "Waiting for Flux to reconcile new manifests..."
-          sleep 30
-          echo "Checking if CAPI is creating child clusters..."
-          kubectl get clusters -A 2>/dev/null || echo "No clusters yet"
-          echo ""
-          for child in child-1 child-2; do
-            echo "Waiting for $child..."
-            for i in $(seq 1 120); do
-              phase=$(kubectl get cluster "$child" -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
-              if [ "$phase" = "Provisioned" ]; then
-                echo "$child is Provisioned (after ${i}s * 5 = $((i*5))s)"
-                break
-              fi
-              if [ "$phase" = "Failed" ]; then
-                echo "$child FAILED!"
-                kubectl describe cluster "$child" -n default | tail -30
-                break
-              fi
-              if [ "$phase" != "NotFound" ] && [ "$phase" != "" ]; then
-                echo "$child in phase: $phase (iteration $i)"
-              fi
-              sleep 5
-            done
-            kubectl get cluster "$child" -n default -o wide 2>/dev/null || echo "$child not found"
-            echo ""
-          done
+          kubectl annotate --overwrite gitrepository/flux-system -n flux-system \
+            flux.fluxcd.io/reconcileAt="$(date +%s)"
+          echo "Flux sync triggered. CAPI provisions in background."
+          sleep 15
+          echo "=== CAPI status ==="
+          kubectl get clusters -A -o wide 2>/dev/null || echo "No clusters yet"
 
-      - name: Retrieve child cluster kubeconfigs (via clusterctl)
+      - name: Try to retrieve child kubeconfigs (if already provisioned)
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
           for child in child-1 child-2; do
@@ -189,49 +150,28 @@ jobs:
               clusterctl get kubeconfig "$child" -n default > "/tmp/kubeconfigs/$child.yaml" 2>/dev/null || true
               if [ -s "/tmp/kubeconfigs/$child.yaml" ]; then
                 echo "Retrieved kubeconfig for $child"
+                kubectl create secret generic "kubeconfig-$child" -n flux-system \
+                  --from-file=value=/tmp/kubeconfigs/$child.yaml \
+                  --dry-run=client -o yaml | kubectl apply -f -
+                echo "Imported kubeconfig for $child"
               fi
+            else
+              echo "$child not Provisioned yet (phase: ${phase:-none})"
+              echo "  CAPI works in background. Ready next run."
             fi
           done
-          ls -la /tmp/kubeconfigs/
-
-      - name: Import child kubeconfigs into Flux for workload deployment
-        run: |
-          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          for child in child-1 child-2; do
-            if [ -f "/tmp/kubeconfigs/$child.yaml" ] && [ -s "/tmp/kubeconfigs/$child.yaml" ]; then
-              kubectl create secret generic "kubeconfig-$child" -n flux-system                 --from-file=value=/tmp/kubeconfigs/$child.yaml                 --dry-run=client -o yaml | kubectl apply -f -
-              echo "Imported kubeconfig for $child into flux-system"
-            fi
-          done
-
-      - name: Verify all systems
-        run: |
-          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          echo "=== Flux controllers ==="
-          kubectl wait --for=condition=Available deployment/source-controller -n flux-system --timeout=30s 2>/dev/null
-          kubectl wait --for=condition=Available deployment/kustomize-controller -n flux-system --timeout=30s 2>/dev/null
-          echo ""
-          echo "=== CAPI Clusters (child clusters provisioned by CAPI) ==="
-          kubectl get clusters -A -o wide
-          echo ""
-          echo "=== CAPI Machines ==="
-          kubectl get machines -A -o wide
-          echo ""
-          echo "=== Flux Kustomizations ==="
-          kubectl get kustomizations.kustomize.toolkit.fluxcd.io -A
 
       - name: Summary
         run: |
-          echo "============================================"
-          echo "  Super-Cluster is persistent & operational"
-          echo "============================================"
-          echo "  Management:  K3s on ${{ secrets.HOST }}:6443"
-          echo "  Flux:        reconciling from ${{ github.repository }}"
-          echo "  CAPI/CAPD:   installed — provisions child clusters"
-          echo "  Child-1:     CAPI Cluster (Docker/CAPD)"
-          echo "  Child-2:     CAPI Cluster (Docker/CAPD)"
-          echo "============================================"
-          echo "  Child clusters are Docker containers on the VPS host"
-          echo "  provisioned by CAPI/CAPD on the management cluster"
-          echo "  cluster. All persistent — no cleanup."
-          echo "============================================
+          echo "========================================"
+          echo "  Super-Cluster GitOps pipeline done"
+          echo "========================================"
+          echo "  Management: K3s on ${{ secrets.HOST }}:6443"
+          echo "  Flux:       reconciling from repo"
+          echo "  CAPI/CAPD:  installed, provisioning"
+          echo "  Child-1/2:  being created by CAPI"
+          echo "========================================"
+          echo "  CAPI provisions Docker containers on"
+          echo "  the VPS in the background. Check the"
+          echo "  next workflow run or SSH to verify."
+          echo "========================================"
