@@ -24,24 +24,22 @@ env:
 jobs:
   ensure-super-cluster:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install tools (sshpass, kubectl, Flux CLI, k3d, clusterctl)
+      - name: Install tools (sshpass, kubectl, Flux CLI, clusterctl)
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
           curl -fsSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.29.2/bin/linux/amd64/kubectl
           chmod +x /usr/local/bin/kubectl
           curl -s https://fluxcd.io/install.sh | sudo bash
-          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
           curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64 -o /usr/local/bin/clusterctl
           chmod +x /usr/local/bin/clusterctl
           kubectl version --client --output=yaml
           flux --version
-          k3d version
           clusterctl version
 
       - name: Test SSH connectivity to VPS
@@ -55,7 +53,6 @@ jobs:
           SSHPASS: ${{ secrets.PASSWORD }}
         run: |
           sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" bash -s <<'REMOTE'
-          export PATH="$PATH:/usr/local/bin"
           set -euo pipefail
           if command -v k3s >/dev/null 2>&1 && systemctl is-active --quiet k3s; then
             echo "K3s management cluster already running"
@@ -75,12 +72,11 @@ jobs:
           kubectl get nodes -o wide
           REMOTE
 
-      - name: Install Docker and k3d on VPS
+      - name: Ensure Docker is installed (required by CAPD)
         env:
           SSHPASS: ${{ secrets.PASSWORD }}
         run: |
           sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" bash -s <<'REMOTE'
-          export PATH="$PATH:/usr/local/bin"
           set -euo pipefail
           if ! command -v docker >/dev/null 2>&1; then
             echo "Installing Docker..."
@@ -88,66 +84,18 @@ jobs:
           else
             echo "Docker already installed"
           fi
-          if command -v k3d >/dev/null 2>&1; then
-            echo "k3d already installed at $(which k3d)"
-          else
-            echo "Installing k3d..."
-            rm -f /usr/local/bin/k3d 2>/dev/null || true
-            curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
-          fi
-          k3d version
+          docker version
           REMOTE
 
-      - name: Ensure persistent child clusters (k3d)
-        env:
-          SSHPASS: ${{ secrets.PASSWORD }}
-        run: |
-          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" bash -s <<'REMOTE'
-          export PATH="$PATH:/usr/local/bin"
-          set -euo pipefail
-          CHILD_CLUSTERS=("child-1" "child-2")
-          for cluster in "${CHILD_CLUSTERS[@]}"; do
-            # Clean up any leftover half-created clusters from failed runs
-            k3d cluster delete "$cluster" 2>/dev/null || true
-            # Remove orphaned Docker containers holding target ports
-            docker rm -f $(docker ps -a -q --filter "name=k3d-$cluster") 2>/dev/null || true
-            if k3d cluster list 2>/dev/null | grep -q "$cluster"; then
-              echo "Child cluster '$cluster' already exists"
-            else
-              echo "Creating child cluster '$cluster'..."
-              case "$cluster" in
-                child-1) PORT_MAP="-p 6444:6443@server:0" ;;
-                child-2) PORT_MAP="-p 6445:6443@server:0" ;;
-                *) PORT_MAP="" ;;
-              esac
-              k3d cluster create "$cluster" --servers 1 --agents 1 $PORT_MAP --wait
-              echo "Created child cluster '$cluster'"
-            fi
-          done
-          echo ""
-          echo "=== Child Clusters ==="
-          k3d cluster list
-          REMOTE
-
-      - name: Retrieve all kubeconfigs
+      - name: Retrieve management kubeconfig
         env:
           SSHPASS: ${{ secrets.PASSWORD }}
         run: |
           mkdir -p /tmp/kubeconfigs
-          # Management cluster kubeconfig
-          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" \
-            'sudo cat /etc/rancher/k3s/k3s.yaml' > /tmp/kubeconfigs/mgmt.yaml
+          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}"             'sudo cat /etc/rancher/k3s/k3s.yaml' > /tmp/kubeconfigs/mgmt.yaml
           sed -i "s/127.0.0.1/${{ secrets.HOST }}/g" /tmp/kubeconfigs/mgmt.yaml
-          # Child cluster kubeconfigs
-          for cluster in child-1 child-2; do
-            sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" \
-              "/usr/local/bin/k3d kubeconfig get $cluster" > "/tmp/kubeconfigs/$cluster.yaml" 2>/dev/null || true
-            if [ -s "/tmp/kubeconfigs/$cluster.yaml" ]; then
-              sed -i "s/0\.0\.0\.0/${{ secrets.HOST }}/g" "/tmp/kubeconfigs/$cluster.yaml"
-              echo "Retrieved kubeconfig for $cluster"
-            fi
-          done
-          ls -la /tmp/kubeconfigs/
+          chmod 600 /tmp/kubeconfigs/mgmt.yaml
+          echo "Management kubeconfig retrieved"
 
       - name: Bootstrap Flux on management cluster
         env:
@@ -155,51 +103,88 @@ jobs:
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
           BRANCH="${GITHUB_REF_NAME:-main}"
-          flux bootstrap git \
-            --url=https://github.com/${GITHUB_REPOSITORY}.git \
-            --branch="${BRANCH}" \
-            --path=./clusters/management \
-            --token-auth \
-            --password="$GITHUB_TOKEN" \
-            --silent
+          kubectl create namespace flux-system --dry-run=client -o yaml | kubectl apply -f -
+          flux bootstrap git             --url=https://github.com/${GITHUB_REPOSITORY}.git             --branch="${BRANCH}"             --path=./clusters/management             --token-auth             --password="$GITHUB_TOKEN"             --silent
 
-      - name: Import child cluster kubeconfigs into Flux
+      - name: Install Cluster API with Docker provider (CAPD)
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          for cluster in child-1 child-2; do
-            if [ -f "/tmp/kubeconfigs/$cluster.yaml" ] && [ -s "/tmp/kubeconfigs/$cluster.yaml" ]; then
-              kubectl create secret generic "kubeconfig-$cluster" -n flux-system \
-                --from-file=value=/tmp/kubeconfigs/$cluster.yaml \
-                --dry-run=client -o yaml | kubectl apply -f -
-              echo "Imported kubeconfig for $cluster into flux-system"
+          echo "Initializing CAPI with Docker provider..."
+          clusterctl init --infrastructure docker
+          kubectl wait --for=condition=Available deployment/capi-controller-manager -n capi-system --timeout=5m 2>/dev/null || true
+          kubectl wait --for=condition=Available deployment/capd-controller-manager -n capd-system --timeout=5m 2>/dev/null || true
+          echo "=== CAPI / CAPD pods ==="
+          kubectl get pods -A | grep -E "capi|capd|NAME"
+
+      - name: Trigger Flux to sync CAPI Cluster manifests
+        run: |
+          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          kubectl annotate --overwrite gitrepository/flux-system -n flux-system             flux.fluxcd.io/reconcileAt="$(date +%s)"
+          echo "Flux sync triggered, waiting for CAPI Cluster resources..."
+          sleep 20
+          echo "=== CAPI Clusters ==="
+          kubectl get clusters -A
+
+      - name: Wait for child clusters to be Provisioned by CAPI/CAPD
+        run: |
+          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          for child in child-1 child-2; do
+            echo "Waiting for $child..."
+            for i in $(seq 1 60); do
+              phase=$(kubectl get cluster "$child" -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+              if [ "$phase" = "Provisioned" ]; then
+                echo "$child is Provisioned (after ${i}s * 5 = $((i*5))s)"
+                break
+              fi
+              if [ "$phase" = "Failed" ]; then
+                echo "$child FAILED!"
+                kubectl describe cluster "$child" -n default | tail -30
+                break
+              fi
+              sleep 5
+            done
+            kubectl get cluster "$child" -n default -o wide 2>/dev/null || echo "$child not found"
+          done
+
+      - name: Retrieve child cluster kubeconfigs (via clusterctl)
+        run: |
+          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          for child in child-1 child-2; do
+            phase=$(kubectl get cluster "$child" -n default -o jsonpath='{.status.phase}' 2>/dev/null)
+            if [ "$phase" = "Provisioned" ]; then
+              clusterctl get kubeconfig "$child" -n default > "/tmp/kubeconfigs/$child.yaml" 2>/dev/null || true
+              if [ -s "/tmp/kubeconfigs/$child.yaml" ]; then
+                echo "Retrieved kubeconfig for $child"
+              fi
+            fi
+          done
+          ls -la /tmp/kubeconfigs/
+
+      - name: Import child kubeconfigs into Flux for workload deployment
+        run: |
+          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          for child in child-1 child-2; do
+            if [ -f "/tmp/kubeconfigs/$child.yaml" ] && [ -s "/tmp/kubeconfigs/$child.yaml" ]; then
+              kubectl create secret generic "kubeconfig-$child" -n flux-system                 --from-file=value=/tmp/kubeconfigs/$child.yaml                 --dry-run=client -o yaml | kubectl apply -f -
+              echo "Imported kubeconfig for $child into flux-system"
             fi
           done
 
-      - name: Install Cluster API on management cluster
-        run: |
-          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          clusterctl init --infrastructure docker
-          echo "=== CAPI/ CAPD components ==="
-          kubectl get pods -n capi-system --ignore-not-found
-          kubectl get pods -n capd-system --ignore-not-found
-
-      - name: Verify Flux reconciliation
+      - name: Verify all systems
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
           echo "=== Flux controllers ==="
-          kubectl wait --for=condition=Available deployment/source-controller -n flux-system --timeout=10m
-          kubectl wait --for=condition=Available deployment/kustomize-controller -n flux-system --timeout=10m
+          kubectl wait --for=condition=Available deployment/source-controller -n flux-system --timeout=30s 2>/dev/null
+          kubectl wait --for=condition=Available deployment/kustomize-controller -n flux-system --timeout=30s 2>/dev/null
+          echo ""
+          echo "=== CAPI Clusters (child clusters provisioned by CAPI) ==="
+          kubectl get clusters -A -o wide
+          echo ""
+          echo "=== CAPI Machines ==="
+          kubectl get machines -A -o wide
+          echo ""
+          echo "=== Flux Kustomizations ==="
           kubectl get kustomizations.kustomize.toolkit.fluxcd.io -A
-          echo ""
-          echo "=== CAPI status ==="
-          kubectl get pods -n capi-system --ignore-not-found
-          kubectl get pods -n capd-system --ignore-not-found
-          echo ""
-          echo "=== Child clusters reachable ==="
-          for cluster in child-1 child-2; do
-            nodes=$(kubectl --kubeconfig="/tmp/kubeconfigs/$cluster.yaml" get nodes --no-headers 2>/dev/null | wc -l)
-            echo "$cluster: $nodes node(s) reachable"
-          done
 
       - name: Summary
         run: |
@@ -207,11 +192,12 @@ jobs:
           echo "  Super-Cluster is persistent & operational"
           echo "============================================"
           echo "  Management:  K3s on ${{ secrets.HOST }}:6443"
-          echo "  Child-1:     ${{ secrets.HOST }}:6444 (k3d)"
-          echo "  Child-2:     ${{ secrets.HOST }}:6445 (k3d)"
           echo "  Flux:        reconciling from ${{ github.repository }}"
-          echo "  CAPI:        installed with Docker provider"
+          echo "  CAPI/CAPD:   installed — provisions child clusters"
+          echo "  Child-1:     CAPI Cluster (Docker/CAPD)"
+          echo "  Child-2:     CAPI Cluster (Docker/CAPD)"
           echo "============================================"
-          echo "  NOTE: Child clusters persist on the VPS"
-          echo "  across workflow runs. No cleanup occurs."
-          echo "============================================"
+          echo "  Child clusters are Docker containers"
+          echo "  provisioned by CAPI/CAPD on the management"
+          echo "  cluster. All persistent — no cleanup."
+          echo "============================================
