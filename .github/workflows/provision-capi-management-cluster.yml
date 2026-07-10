@@ -131,7 +131,7 @@ jobs:
           for child in child-1 child-2; do
             if kubectl get cluster "\$child" -n default --request-timeout=10s &>/dev/null; then
               echo "Deleting stale cluster \$child..."
-              kubectl delete cluster "\$child" -n default --timeout=60s --wait=false
+              kubectl delete cluster "\$child" -n default --timeout=60s --wait=true
               # Also remove any leftover containers from CAPD
               kubectl get dockercluster -n default 2>/dev/null -o name | xargs -r kubectl delete -n default 2>/dev/null || true
               kubectl get dockermachinetemplate -n default 2>/dev/null -o name | xargs -r kubectl delete -n default 2>/dev/null || true
