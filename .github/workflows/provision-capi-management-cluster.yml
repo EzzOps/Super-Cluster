@@ -10,6 +10,7 @@ on:
       - 'clusters/child/**'
 
 env:
+  # SSH options for password-based auth to VPS
   SSH_OPTS: >-
     -o StrictHostKeyChecking=no
     -o PreferredAuthentications=password
