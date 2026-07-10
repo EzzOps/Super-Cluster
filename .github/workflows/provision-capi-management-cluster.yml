@@ -131,7 +131,7 @@ jobs:
           for child in child-1 child-2; do
             echo "Waiting for $child..."
             for i in $(seq 1 60); do
-              phase=$(kubectl get cluster "$child" -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+              phase=$(kubectl get cluster "$child" -n default -o jsonpath='{.status.phase}' --request-timeout=5s 2>/dev/null || echo "NotFound")
               if [ "$phase" = "Provisioned" ]; then
                 echo "$child is Provisioned (after ${i}s * 5 = $((i*5))s)"
                 break
@@ -198,6 +198,6 @@ jobs:
           echo "  Child-2:     CAPI Cluster (Docker/CAPD)"
           echo "============================================"
           echo "  Child clusters are Docker containers"
-          echo "  provisioned by CAPI/CAPD on the management"
+          echo "  provisioned by CAPI/CAPD on the management node"
           echo "  cluster. All persistent — no cleanup."
           echo "============================================
