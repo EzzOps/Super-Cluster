@@ -1,16 +1,13 @@
 apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
 metadata:
-  name: remote-child
+  name: cluster-resources
   namespace: flux-system
 spec:
-  interval: 1m
+  interval: 5m
   path: ./clusters/child
   prune: true
   sourceRef:
     kind: GitRepository
     name: flux-system
   targetNamespace: default
-  kubeConfig:
-    secretRef:
-      name: contabo-kubeconfig
