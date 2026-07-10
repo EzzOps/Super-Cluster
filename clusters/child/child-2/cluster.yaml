@@ -11,88 +11,13 @@ spec:
     services:
       cidrBlocks:
         - 10.96.0.0/12
-  infrastructureRef:
-    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-    kind: DockerCluster
-    name: child-2
-  controlPlaneRef:
-    kind: KubeadmControlPlane
-    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
-    name: child-2-control-plane
----
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: DockerCluster
-metadata:
-  name: child-2
-  namespace: default
----
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: DockerMachineTemplate
-metadata:
-  name: child-2-control-plane
-  namespace: default
-spec:
-  template:
-    spec: {}
----
-apiVersion: controlplane.cluster.x-k8s.io/v1beta1
-kind: KubeadmControlPlane
-metadata:
-  name: child-2-control-plane
-  namespace: default
-spec:
-  replicas: 1
-  machineTemplate:
-    infrastructureRef:
-      kind: DockerMachineTemplate
-      apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-      name: child-2-control-plane
-  kubeadmConfigSpec:
-    clusterConfiguration:
-      controllerManager:
-        extraArgs:
-          enable-hostpath-provisioner: "true"
-    initConfiguration:
-      nodeRegistration:
-        criSocket: /var/run/containerd/containerd.sock
-  version: v1.29.2
----
-apiVersion: cluster.x-k8s.io/v1beta1
-kind: MachineDeployment
-metadata:
-  name: child-2-md-0
-  namespace: default
-spec:
-  clusterName: child-2
-  replicas: 1
-  template:
-    spec:
-      clusterName: child-2
-      version: v1.29.2
-      bootstrap:
-        configRef:
-          name: child-2-md-0
-          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
-          kind: KubeadmConfigTemplate
-      infrastructureRef:
-        name: child-2-md-0
-        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-        kind: DockerMachineTemplate
----
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: DockerMachineTemplate
-metadata:
-  name: child-2-md-0
-  namespace: default
-spec:
-  template:
-    spec: {}
----
-apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
-kind: KubeadmConfigTemplate
-metadata:
-  name: child-2-md-0
-  namespace: default
-spec:
-  template:
-    spec: {}
+  topology:
+    class: quick-start
+    version: v1.29.2
+    controlPlane:
+      replicas: 1
+    workers:
+      machineDeployments:
+        - class: default-worker
+          name: md-0
+          replicas: 1
