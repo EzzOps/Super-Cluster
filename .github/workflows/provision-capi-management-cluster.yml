@@ -109,6 +109,8 @@ jobs:
           for cluster in "${CHILD_CLUSTERS[@]}"; do
             # Clean up any leftover half-created clusters from failed runs
             k3d cluster delete "$cluster" 2>/dev/null || true
+            # Remove orphaned Docker containers holding target ports
+            docker rm -f $(docker ps -a -q --filter "name=k3d-$cluster") 2>/dev/null || true
             if k3d cluster list 2>/dev/null | grep -q "$cluster"; then
               echo "Child cluster '$cluster' already exists"
             else
