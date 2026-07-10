@@ -137,7 +137,7 @@ jobs:
           # Child cluster kubeconfigs
           for cluster in child-1 child-2; do
             sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" \
-              "k3d kubeconfig get $cluster" > "/tmp/kubeconfigs/$cluster.yaml" 2>/dev/null || true
+              "/usr/local/bin/k3d kubeconfig get $cluster" > "/tmp/kubeconfigs/$cluster.yaml" 2>/dev/null || true
             if [ -s "/tmp/kubeconfigs/$cluster.yaml" ]; then
               sed -i "s/0\.0\.0\.0/${{ secrets.HOST }}/g" "/tmp/kubeconfigs/$cluster.yaml"
               echo "Retrieved kubeconfig for $cluster"
