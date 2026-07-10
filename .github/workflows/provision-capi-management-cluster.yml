@@ -93,6 +93,7 @@ jobs:
             --branch="${BRANCH}" \
             --path=./clusters/management \
             --token-auth \
+            --password="$GITHUB_TOKEN" \
             --silent
 
       - name: Configure target kubeconfig for Flux
