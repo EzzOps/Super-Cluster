@@ -116,6 +116,21 @@ jobs:
           echo "=== CAPI / CAPD pods ==="
           kubectl get pods -A | grep -E "capi|capd|NAME"
 
+      - name: Remove stale CAPI clusters from previous runs
+        run: |
+          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          for child in child-1 child-2; do
+            if kubectl get cluster "\$child" -n default --request-timeout=10s &>/dev/null; then
+              echo "Deleting stale cluster \$child..."
+              kubectl delete cluster "\$child" -n default --timeout=60s --wait=false
+              # Also remove any leftover containers from CAPD
+              kubectl get dockercluster -n default 2>/dev/null -o name | xargs -r kubectl delete -n default 2>/dev/null || true
+              kubectl get dockermachinetemplate -n default 2>/dev/null -o name | xargs -r kubectl delete -n default 2>/dev/null || true
+            fi
+          done
+          echo "Cleaned up stale CAPI resources"
+          kubectl get clusters -A --request-timeout=10s 2>/dev/null || echo "No clusters remaining"
+
       - name: Trigger Flux to sync CAPI Cluster manifests
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
@@ -197,7 +212,7 @@ jobs:
           echo "  Child-1:     CAPI Cluster (Docker/CAPD)"
           echo "  Child-2:     CAPI Cluster (Docker/CAPD)"
           echo "============================================"
-          echo "  Child clusters are Docker containers"
-          echo "  provisioned by CAPI/CAPD on the management node"
+          echo "  Child clusters are Docker containers on the VPS"
+          echo "  provisioned by CAPI/CAPD on the management cluster"
           echo "  cluster. All persistent — no cleanup."
           echo "============================================
