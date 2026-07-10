@@ -1,19 +1,19 @@
-name: Provision ephemeral management cluster on VPS
+name: Provision persistent Super-Cluster on VPS
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
     paths:
       - '.github/workflows/provision-capi-management-cluster.yml'
-      - 'clusters/management/**'
-      - 'clusters/child/**'
+      - 'clusters/**'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
 
 permissions:
   contents: write
 
 env:
-  # SSH options for password-based auth to VPS
   SSH_OPTS: >-
     -o StrictHostKeyChecking=no
     -o PreferredAuthentications=password
@@ -22,7 +22,7 @@ env:
     -o LogLevel=ERROR
 
 jobs:
-  provision-management-cluster:
+  ensure-super-cluster:
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -30,35 +30,39 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install tools (sshpass, kubectl, Flux CLI)
+      - name: Install tools (sshpass, kubectl, Flux CLI, k3d, clusterctl)
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
           curl -fsSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.29.2/bin/linux/amd64/kubectl
           chmod +x /usr/local/bin/kubectl
           curl -s https://fluxcd.io/install.sh | sudo bash
+          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64 -o /usr/local/bin/clusterctl
+          chmod +x /usr/local/bin/clusterctl
           kubectl version --client --output=yaml
           flux --version
+          k3d version
+          clusterctl version
 
       - name: Test SSH connectivity to VPS
         env:
           SSHPASS: ${{ secrets.PASSWORD }}
         run: |
-          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" "echo SSH_OK"
-          echo "SSH connection verified"
+          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" "echo SSH_OK && uname -a && free -h"
 
-      - name: Provision ephemeral K3s management cluster on VPS
+      - name: Ensure K3s management cluster is running
         env:
           SSHPASS: ${{ secrets.PASSWORD }}
         run: |
           sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" bash -s <<'REMOTE'
           set -euo pipefail
-          export DEBIAN_FRONTEND=noninteractive
-          if command -v k3s >/dev/null 2>&1; then
-            echo "K3s already installed -- skipping install"
+          if command -v k3s >/dev/null 2>&1 && systemctl is-active --quiet k3s; then
+            echo "K3s management cluster already running"
           else
+            echo "Installing K3s management cluster..."
             curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode=644" sh -
+            systemctl enable --now k3s
           fi
-          systemctl enable --now k3s 2>/dev/null || true
           echo "Waiting for K3s to be ready..."
           for i in $(seq 1 30); do
             if kubectl get nodes --no-headers 2>/dev/null | grep -q Ready; then
@@ -67,27 +71,82 @@ jobs:
             fi
             sleep 2
           done
-          kubectl get nodes
+          kubectl get nodes -o wide
           REMOTE
 
-      - name: Retrieve kubeconfig from VPS
+      - name: Install Docker and k3d on VPS
         env:
           SSHPASS: ${{ secrets.PASSWORD }}
         run: |
-          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" 'sudo cat /etc/rancher/k3s/k3s.yaml' > /tmp/mgmt-kubeconfig.yaml
-          sed -i "s/127.0.0.1/${{ secrets.HOST }}/g" /tmp/mgmt-kubeconfig.yaml
-          chmod 600 /tmp/mgmt-kubeconfig.yaml
-          export KUBECONFIG=/tmp/mgmt-kubeconfig.yaml
-          kubectl cluster-info
-          kubectl get nodes -o wide
+          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" bash -s <<'REMOTE'
+          set -euo pipefail
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "Installing Docker..."
+            curl -fsSL https://get.docker.com | sh
+          else
+            echo "Docker already installed"
+          fi
+          if ! command -v k3d >/dev/null 2>&1; then
+            echo "Installing k3d..."
+            curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          else
+            echo "k3d already installed"
+          fi
+          k3d version
+          REMOTE
 
-      - name: Bootstrap Flux on the management cluster
+      - name: Ensure persistent child clusters (k3d)
+        env:
+          SSHPASS: ${{ secrets.PASSWORD }}
+        run: |
+          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" bash -s <<'REMOTE'
+          set -euo pipefail
+          CHILD_CLUSTERS=("child-1" "child-2")
+          for cluster in "${CHILD_CLUSTERS[@]}"; do
+            if k3d cluster list 2>/dev/null | grep -q "$cluster"; then
+              echo "Child cluster '$cluster' already exists"
+            else
+              echo "Creating child cluster '$cluster'..."
+              case "$cluster" in
+                child-1) PORT_MAP="-p 6444:6443@server:0" ;;
+                child-2) PORT_MAP="-p 6445:6443@server:0" ;;
+                *) PORT_MAP="" ;;
+              esac
+              k3d cluster create "$cluster" --servers 1 --agents 1 $PORT_MAP --wait
+              echo "Created child cluster '$cluster'"
+            fi
+          done
+          echo ""
+          echo "=== Child Clusters ==="
+          k3d cluster list
+          REMOTE
+
+      - name: Retrieve all kubeconfigs
+        env:
+          SSHPASS: ${{ secrets.PASSWORD }}
+        run: |
+          mkdir -p /tmp/kubeconfigs
+          # Management cluster kubeconfig
+          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" \
+            'sudo cat /etc/rancher/k3s/k3s.yaml' > /tmp/kubeconfigs/mgmt.yaml
+          sed -i "s/127.0.0.1/${{ secrets.HOST }}/g" /tmp/kubeconfigs/mgmt.yaml
+          # Child cluster kubeconfigs
+          for cluster in child-1 child-2; do
+            sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" \
+              "k3d kubeconfig get $cluster" > "/tmp/kubeconfigs/$cluster.yaml" 2>/dev/null || true
+            if [ -s "/tmp/kubeconfigs/$cluster.yaml" ]; then
+              sed -i "s/0\.0\.0\.0/${{ secrets.HOST }}/g" "/tmp/kubeconfigs/$cluster.yaml"
+              echo "Retrieved kubeconfig for $cluster"
+            fi
+          done
+          ls -la /tmp/kubeconfigs/
+
+      - name: Bootstrap Flux on management cluster
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          export KUBECONFIG=/tmp/mgmt-kubeconfig.yaml
+          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
           BRANCH="${GITHUB_REF_NAME:-main}"
-          kubectl create namespace flux-system --dry-run=client -o yaml | kubectl apply -f -
           flux bootstrap git \
             --url=https://github.com/${GITHUB_REPOSITORY}.git \
             --branch="${BRANCH}" \
@@ -96,30 +155,55 @@ jobs:
             --password="$GITHUB_TOKEN" \
             --silent
 
-      - name: Configure target kubeconfig for Flux
-        env:
-          SSHPASS: ${{ secrets.PASSWORD }}
+      - name: Import child cluster kubeconfigs into Flux
         run: |
-          export KUBECONFIG=/tmp/mgmt-kubeconfig.yaml
-          mkdir -p /tmp/flux-secrets
-          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" 'sudo cat /etc/rancher/k3s/k3s.yaml' > /tmp/flux-secrets/contabo-kubeconfig
-          sed -i "s/127.0.0.1/${{ secrets.HOST }}/g" /tmp/flux-secrets/contabo-kubeconfig
-          kubectl create secret generic contabo-kubeconfig -n flux-system \
-            --from-file=value=/tmp/flux-secrets/contabo-kubeconfig \
-            --dry-run=client -o yaml | kubectl apply -f -
+          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          for cluster in child-1 child-2; do
+            if [ -f "/tmp/kubeconfigs/$cluster.yaml" ] && [ -s "/tmp/kubeconfigs/$cluster.yaml" ]; then
+              kubectl create secret generic "kubeconfig-$cluster" -n flux-system \
+                --from-file=value=/tmp/kubeconfigs/$cluster.yaml \
+                --dry-run=client -o yaml | kubectl apply -f -
+              echo "Imported kubeconfig for $cluster into flux-system"
+            fi
+          done
+
+      - name: Install Cluster API on management cluster
+        run: |
+          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          clusterctl init --infrastructure docker
+          echo "=== CAPI/ CAPD components ==="
+          kubectl get pods -n capi-system --ignore-not-found
+          kubectl get pods -n capd-system --ignore-not-found
 
       - name: Verify Flux reconciliation
         run: |
-          export KUBECONFIG=/tmp/mgmt-kubeconfig.yaml
+          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          echo "=== Flux controllers ==="
           kubectl wait --for=condition=Available deployment/source-controller -n flux-system --timeout=10m
           kubectl wait --for=condition=Available deployment/kustomize-controller -n flux-system --timeout=10m
           kubectl get kustomizations.kustomize.toolkit.fluxcd.io -A
-          echo "=== Flux is ready ==="
+          echo ""
+          echo "=== CAPI status ==="
+          kubectl get pods -n capi-system --ignore-not-found
+          kubectl get pods -n capd-system --ignore-not-found
+          echo ""
+          echo "=== Child clusters reachable ==="
+          for cluster in child-1 child-2; do
+            nodes=$(kubectl --kubeconfig="/tmp/kubeconfigs/$cluster.yaml" get nodes --no-headers 2>/dev/null | wc -l)
+            echo "$cluster: $nodes node(s) reachable"
+          done
 
-      - name: Cleanup (uninstall K3s from VPS)
-        if: always()
-        env:
-          SSHPASS: ${{ secrets.PASSWORD }}
+      - name: Summary
         run: |
-          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" \
-            'if command -v k3s-uninstall.sh >/dev/null 2>&1; then sudo k3s-uninstall.sh; elif command -v k3s >/dev/null 2>&1; then /usr/local/bin/k3s-uninstall.sh || true; fi' || echo "Cleanup skipped (VPS may not be reachable or K3s not installed)"
+          echo "============================================"
+          echo "  Super-Cluster is persistent & operational"
+          echo "============================================"
+          echo "  Management:  K3s on ${{ secrets.HOST }}:6443"
+          echo "  Child-1:     ${{ secrets.HOST }}:6444 (k3d)"
+          echo "  Child-2:     ${{ secrets.HOST }}:6445 (k3d)"
+          echo "  Flux:        reconciling from ${{ github.repository }}"
+          echo "  CAPI:        installed with Docker provider"
+          echo "============================================"
+          echo "  NOTE: Child clusters persist on the VPS"
+          echo "  across workflow runs. No cleanup occurs."
+          echo "============================================"
