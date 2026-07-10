@@ -151,10 +151,17 @@ jobs:
       - name: Wait for child clusters to be Provisioned by CAPI/CAPD
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          # Force Flux to sync latest manifests from repo
+          kubectl annotate --overwrite gitrepository/flux-system -n flux-system             flux.fluxcd.io/reconcileAt="$(date +%s)"
+          echo "Waiting for Flux to reconcile new manifests..."
+          sleep 30
+          echo "Checking if CAPI is creating child clusters..."
+          kubectl get clusters -A 2>/dev/null || echo "No clusters yet"
+          echo ""
           for child in child-1 child-2; do
             echo "Waiting for $child..."
-            for i in $(seq 1 60); do
-              phase=$(kubectl get cluster "$child" -n default -o jsonpath='{.status.phase}' --request-timeout=5s 2>/dev/null || echo "NotFound")
+            for i in $(seq 1 120); do
+              phase=$(kubectl get cluster "$child" -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
               if [ "$phase" = "Provisioned" ]; then
                 echo "$child is Provisioned (after ${i}s * 5 = $((i*5))s)"
                 break
@@ -164,9 +171,13 @@ jobs:
                 kubectl describe cluster "$child" -n default | tail -30
                 break
               fi
+              if [ "$phase" != "NotFound" ] && [ "$phase" != "" ]; then
+                echo "$child in phase: $phase (iteration $i)"
+              fi
               sleep 5
             done
             kubectl get cluster "$child" -n default -o wide 2>/dev/null || echo "$child not found"
+            echo ""
           done
 
       - name: Retrieve child cluster kubeconfigs (via clusterctl)
