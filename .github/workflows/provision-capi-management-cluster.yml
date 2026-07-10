@@ -137,8 +137,16 @@ jobs:
               kubectl get dockermachinetemplate -n default 2>/dev/null -o name | xargs -r kubectl delete -n default 2>/dev/null || true
             fi
           done
-          echo "Cleaned up stale CAPI resources"
-          kubectl get clusters -A --request-timeout=10s 2>/dev/null || echo "No clusters remaining"
+          echo "Waiting for stale clusters to be fully removed..."
+          for i in $(seq 1 30); do
+            remaining=$(kubectl get clusters -A --request-timeout=10s --no-headers 2>/dev/null | wc -l)
+            if [ "$remaining" = "0" ]; then
+              echo "All stale clusters removed after ${i}s"
+              break
+            fi
+            sleep 2
+          done
+          echo "Verified: No stale CAPI clusters remaining"
 
       - name: Wait for child clusters to be Provisioned by CAPI/CAPD
         run: |
@@ -212,7 +220,7 @@ jobs:
           echo "  Child-1:     CAPI Cluster (Docker/CAPD)"
           echo "  Child-2:     CAPI Cluster (Docker/CAPD)"
           echo "============================================"
-          echo "  Child clusters are Docker containers on the VPS"
+          echo "  Child clusters are Docker containers on the VPS host"
           echo "  provisioned by CAPI/CAPD on the management cluster"
           echo "  cluster. All persistent — no cleanup."
           echo "============================================
