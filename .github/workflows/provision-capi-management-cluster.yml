@@ -99,7 +99,7 @@ jobs:
 
       - name: Bootstrap Flux on management cluster
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
           BRANCH="${GITHUB_REF_NAME:-main}"
