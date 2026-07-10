@@ -107,6 +107,8 @@ jobs:
           set -euo pipefail
           CHILD_CLUSTERS=("child-1" "child-2")
           for cluster in "${CHILD_CLUSTERS[@]}"; do
+            # Clean up any leftover half-created clusters from failed runs
+            k3d cluster delete "$cluster" 2>/dev/null || true
             if k3d cluster list 2>/dev/null | grep -q "$cluster"; then
               echo "Child cluster '$cluster' already exists"
             else
