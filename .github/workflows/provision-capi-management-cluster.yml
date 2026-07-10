@@ -53,7 +53,6 @@ jobs:
         run: |
           sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no "${USER}@${HOST}" 'sudo cat /etc/rancher/k3s/k3s.yaml' > /tmp/mgmt-kubeconfig.yaml
           sed -i "s/127.0.0.1/${HOST}/g" /tmp/mgmt-kubeconfig.yaml
-          sed -i 's|https://127.0.0.1:6443|https://${HOST}:6443|g' /tmp/mgmt-kubeconfig.yaml
           chmod 600 /tmp/mgmt-kubeconfig.yaml
           export KUBECONFIG=/tmp/mgmt-kubeconfig.yaml
           kubectl cluster-info
@@ -81,7 +80,6 @@ jobs:
           mkdir -p /tmp/flux-secrets
           sshpass -p "$PASSWORD" scp -o StrictHostKeyChecking=no "${USER}@${HOST}:/etc/rancher/k3s/k3s.yaml" /tmp/flux-secrets/contabo-kubeconfig
           sed -i "s/127.0.0.1/${HOST}/g" /tmp/flux-secrets/contabo-kubeconfig
-          sed -i 's|https://127.0.0.1:6443|https://${HOST}:6443|g' /tmp/flux-secrets/contabo-kubeconfig
           kubectl create secret generic contabo-kubeconfig -n flux-system --from-file=value=/tmp/flux-secrets/contabo-kubeconfig --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Verify Flux reconciliation
