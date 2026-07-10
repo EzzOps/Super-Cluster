@@ -9,6 +9,9 @@ on:
       - 'clusters/management/**'
       - 'clusters/child/**'
 
+permissions:
+  contents: write
+
 env:
   # SSH options for password-based auth to VPS
   SSH_OPTS: >-
@@ -80,7 +83,7 @@ jobs:
 
       - name: Bootstrap Flux on the management cluster
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           export KUBECONFIG=/tmp/mgmt-kubeconfig.yaml
           BRANCH="${GITHUB_REF_NAME:-main}"
