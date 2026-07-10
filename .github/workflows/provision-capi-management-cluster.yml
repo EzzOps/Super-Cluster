@@ -9,14 +9,18 @@ on:
       - 'clusters/management/**'
       - 'clusters/child/**'
 
+env:
+  SSH_OPTS: >-
+    -o StrictHostKeyChecking=no
+    -o PreferredAuthentications=password
+    -o PubkeyAuthentication=no
+    -o UserKnownHostsFile=/dev/null
+    -o LogLevel=ERROR
+
 jobs:
   provision-management-cluster:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      HOST: ${{ secrets.HOST }}
-      USER: ${{ secrets.USER }}
-      PASSWORD: ${{ secrets.PASSWORD }}
 
     steps:
       - name: Checkout repository
@@ -31,17 +35,30 @@ jobs:
           kubectl version --client --output=yaml
           flux --version
 
-      - name: Provision ephemeral K3s management cluster on VPS
+      - name: Test SSH connectivity to VPS
+        env:
+          SSHPASS: \${{ secrets.PASSWORD }}
         run: |
-          sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no "${USER}@${HOST}" bash -s <<'REMOTE'
+          sshpass -e ssh \$SSH_OPTS "\${{ secrets.USER }}@\${{ secrets.HOST }}" "echo SSH_OK"
+          echo "SSH connection verified"
+
+      - name: Provision ephemeral K3s management cluster on VPS
+        env:
+          SSHPASS: \${{ secrets.PASSWORD }}
+        run: |
+          sshpass -e ssh \$SSH_OPTS "\${{ secrets.USER }}@\${{ secrets.HOST }}" bash -s <<'REMOTE'
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
-          curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode=644" sh -
-          systemctl enable --now k3s
+          if command -v k3s >/dev/null 2>&1; then
+            echo "K3s already installed — skipping install"
+          else
+            curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode=644" sh -
+          fi
+          systemctl enable --now k3s 2>/dev/null || true
           echo "Waiting for K3s to be ready..."
           for i in $(seq 1 30); do
             if kubectl get nodes --no-headers 2>/dev/null | grep -q Ready; then
-              echo "K3s ready after ${i}s"
+              echo "K3s ready after \${i}s"
               break
             fi
             sleep 2
@@ -50,9 +67,11 @@ jobs:
           REMOTE
 
       - name: Retrieve kubeconfig from VPS
+        env:
+          SSHPASS: \${{ secrets.PASSWORD }}
         run: |
-          sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no "${USER}@${HOST}" 'sudo cat /etc/rancher/k3s/k3s.yaml' > /tmp/mgmt-kubeconfig.yaml
-          sed -i "s/127.0.0.1/${HOST}/g" /tmp/mgmt-kubeconfig.yaml
+          sshpass -e ssh \$SSH_OPTS "\${{ secrets.USER }}@\${{ secrets.HOST }}" 'sudo cat /etc/rancher/k3s/k3s.yaml' > /tmp/mgmt-kubeconfig.yaml
+          sed -i "s/127.0.0.1/\${{ secrets.HOST }}/g" /tmp/mgmt-kubeconfig.yaml
           chmod 600 /tmp/mgmt-kubeconfig.yaml
           export KUBECONFIG=/tmp/mgmt-kubeconfig.yaml
           kubectl cluster-info
@@ -60,27 +79,29 @@ jobs:
 
       - name: Bootstrap Flux on the management cluster
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: \${{ secrets.GITHUB_TOKEN }}
         run: |
           export KUBECONFIG=/tmp/mgmt-kubeconfig.yaml
-          BRANCH="${GITHUB_REF_NAME:-main}"
-          # Create the flux-system namespace first
+          BRANCH="\${GITHUB_REF_NAME:-main}"
           kubectl create namespace flux-system --dry-run=client -o yaml | kubectl apply -f -
-          # Bootstrap Flux using token auth
           flux bootstrap git \
-            --url=https://github.com/${GITHUB_REPOSITORY}.git \
-            --branch="${BRANCH}" \
+            --url=https://github.com/\${GITHUB_REPOSITORY}.git \
+            --branch="\${BRANCH}" \
             --path=./clusters/management \
             --token-auth \
             --silent
 
       - name: Configure target kubeconfig for Flux
+        env:
+          SSHPASS: \${{ secrets.PASSWORD }}
         run: |
           export KUBECONFIG=/tmp/mgmt-kubeconfig.yaml
           mkdir -p /tmp/flux-secrets
-          sshpass -p "$PASSWORD" scp -o StrictHostKeyChecking=no "${USER}@${HOST}:/etc/rancher/k3s/k3s.yaml" /tmp/flux-secrets/contabo-kubeconfig
-          sed -i "s/127.0.0.1/${HOST}/g" /tmp/flux-secrets/contabo-kubeconfig
-          kubectl create secret generic contabo-kubeconfig -n flux-system --from-file=value=/tmp/flux-secrets/contabo-kubeconfig --dry-run=client -o yaml | kubectl apply -f -
+          sshpass -e ssh \$SSH_OPTS "\${{ secrets.USER }}@\${{ secrets.HOST }}" 'sudo cat /etc/rancher/k3s/k3s.yaml' > /tmp/flux-secrets/contabo-kubeconfig
+          sed -i "s/127.0.0.1/\${{ secrets.HOST }}/g" /tmp/flux-secrets/contabo-kubeconfig
+          kubectl create secret generic contabo-kubeconfig -n flux-system \
+            --from-file=value=/tmp/flux-secrets/contabo-kubeconfig \
+            --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Verify Flux reconciliation
         run: |
@@ -90,7 +111,10 @@ jobs:
           kubectl get kustomizations.kustomize.toolkit.fluxcd.io -A
           echo "=== Flux is ready ==="
 
-      - name: Cleanup
+      - name: Cleanup (uninstall K3s from VPS)
         if: always()
+        env:
+          SSHPASS: \${{ secrets.PASSWORD }}
         run: |
-          sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no "${USER}@${HOST}" 'if command -v k3s >/dev/null 2>&1; then /usr/local/bin/k3s-uninstall.sh || true; fi'
+          sshpass -e ssh \$SSH_OPTS "\${{ secrets.USER }}@\${{ secrets.HOST }}" \
+            'if command -v k3s-uninstall.sh >/dev/null 2>&1; then sudo k3s-uninstall.sh; elif command -v k3s >/dev/null 2>&1; then /usr/local/bin/k3s-uninstall.sh || true; fi' || echo "Cleanup skipped (VPS may not be reachable or K3s not installed)"
