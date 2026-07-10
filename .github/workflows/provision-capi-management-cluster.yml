@@ -21,43 +21,58 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}        
 
-      - name: Install kubectl and Flux CLI
+      - name: Install tools (sshpass, kubectl, Flux CLI)
         run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
           curl -fsSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.29.2/bin/linux/amd64/kubectl
           chmod +x /usr/local/bin/kubectl
           curl -s https://fluxcd.io/install.sh | sudo bash
           kubectl version --client --output=yaml
           flux --version
 
-      - name: Provision ephemeral management cluster on VPS
+      - name: Provision ephemeral K3s management cluster on VPS
         run: |
           sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no "${USER}@${HOST}" bash -s <<'REMOTE'
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
           curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode=644" sh -
           systemctl enable --now k3s
-          sleep 10
+          echo "Waiting for K3s to be ready..."
+          for i in $(seq 1 30); do
+            if kubectl get nodes --no-headers 2>/dev/null | grep -q Ready; then
+              echo "K3s ready after ${i}s"
+              break
+            fi
+            sleep 2
+          done
+          kubectl get nodes
           REMOTE
 
       - name: Retrieve kubeconfig from VPS
         run: |
           sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no "${USER}@${HOST}" 'sudo cat /etc/rancher/k3s/k3s.yaml' > /tmp/mgmt-kubeconfig.yaml
           sed -i "s/127.0.0.1/${HOST}/g" /tmp/mgmt-kubeconfig.yaml
+          sed -i 's|https://127.0.0.1:6443|https://${HOST}:6443|g' /tmp/mgmt-kubeconfig.yaml
           chmod 600 /tmp/mgmt-kubeconfig.yaml
           export KUBECONFIG=/tmp/mgmt-kubeconfig.yaml
-          kubectl get nodes
+          kubectl cluster-info
+          kubectl get nodes -o wide
 
       - name: Bootstrap Flux on the management cluster
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           export KUBECONFIG=/tmp/mgmt-kubeconfig.yaml
           BRANCH="${GITHUB_REF_NAME:-main}"
+          # Create the flux-system namespace first
+          kubectl create namespace flux-system --dry-run=client -o yaml | kubectl apply -f -
+          # Bootstrap Flux using token auth
           flux bootstrap git \
             --url=https://github.com/${GITHUB_REPOSITORY}.git \
             --branch="${BRANCH}" \
             --path=./clusters/management \
+            --token-auth \
             --silent
 
       - name: Configure target kubeconfig for Flux
@@ -66,6 +81,7 @@ jobs:
           mkdir -p /tmp/flux-secrets
           sshpass -p "$PASSWORD" scp -o StrictHostKeyChecking=no "${USER}@${HOST}:/etc/rancher/k3s/k3s.yaml" /tmp/flux-secrets/contabo-kubeconfig
           sed -i "s/127.0.0.1/${HOST}/g" /tmp/flux-secrets/contabo-kubeconfig
+          sed -i 's|https://127.0.0.1:6443|https://${HOST}:6443|g' /tmp/flux-secrets/contabo-kubeconfig
           kubectl create secret generic contabo-kubeconfig -n flux-system --from-file=value=/tmp/flux-secrets/contabo-kubeconfig --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Verify Flux reconciliation
@@ -74,6 +90,7 @@ jobs:
           kubectl wait --for=condition=Available deployment/source-controller -n flux-system --timeout=10m
           kubectl wait --for=condition=Available deployment/kustomize-controller -n flux-system --timeout=10m
           kubectl get kustomizations.kustomize.toolkit.fluxcd.io -A
+          echo "=== Flux is ready ==="
 
       - name: Cleanup
         if: always()
