@@ -144,30 +144,38 @@ jobs:
           echo "Flux reconcile triggered."
           echo "CAPI will create/update child clusters declaratively from repo manifests."
           echo ""
-          sleep 15
-          echo "=== Current CAPI state ==="
-          kubectl get clusters -A -o wide 2>/dev/null || echo "No clusters yet"
-          kubectl get machines -A -o wide 2>/dev/null || echo "No machines yet"
 
-      - name: Retrieve child kubeconfigs (if provisioned) and import into Flux
+      - name: Wait for child clusters (CAPD) to provision and retrieve kubeconfigs
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
           CHILD_CLUSTERS="${{ steps.config.outputs.child_clusters }}"
+          echo "Waiting for child clusters to become Provisioned (up to 5 min)..."
           for child in $CHILD_CLUSTERS; do
-            phase=$(kubectl get cluster "$child" -n default -o jsonpath='{.status.phase}' 2>/dev/null)
-            if [ "$phase" = "Provisioned" ]; then
-              clusterctl get kubeconfig "$child" -n default > "/tmp/kubeconfigs/$child.yaml" 2>/dev/null || true
-              if [ -s "/tmp/kubeconfigs/$child.yaml" ]; then
-                echo "Retrieved kubeconfig for $child"
-                kubectl create secret generic "kubeconfig-$child" -n flux-system \
-                  --from-file=value=/tmp/kubeconfigs/$child.yaml \
-                  --dry-run=client -o yaml | kubectl apply -f -
-                echo "Imported kubeconfig for $child into Flux"
+            echo "--- Checking $child ---"
+            for i in $(seq 1 30); do
+              # Get phase, handle case where cluster resource doesn't exist yet
+              phase=$(kubectl get cluster "$child" -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+              if [ "$phase" = "Provisioned" ]; then
+                echo "$child is Provisioned after ~$((i * 10))s"
+                # Retrieve and store kubeconfig
+                clusterctl get kubeconfig "$child" -n default > "/tmp/kubeconfigs/$child.yaml" 2>/dev/null || true
+                if [ -s "/tmp/kubeconfigs/$child.yaml" ]; then
+                  echo "  ✅ Retrieved kubeconfig for $child"
+                  kubectl create secret generic "kubeconfig-$child" -n flux-system \
+                    --from-file=value=/tmp/kubeconfigs/$child.yaml \
+                    --dry-run=client -o yaml | kubectl apply -f -
+                  echo "  ✅ Imported kubeconfig-$child into Flux"
+                fi
+                break
               fi
-            else
-              echo "Skipping $child - not Provisioned yet (phase: ${phase:-none}). Ready next run."
-            fi
+              echo "  $child phase: ${phase:-N/A} (not ready yet, retrying in 10s)..."
+              sleep 10
+            done
           done
+          echo ""
+          echo "=== Final CAPI state ==="
+          kubectl get clusters -A -o wide 2>/dev/null || echo "No clusters"
+          kubectl get machines -A -o wide 2>/dev/null || echo "No machines"
 
       - name: Summary
         run: |
