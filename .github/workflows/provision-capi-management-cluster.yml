@@ -23,7 +23,7 @@ env:
 
 jobs:
   # ──────────────────────────────────────────────
-  # JOB 1: Setup — discover config, install tools, verify connectivity
+  # JOB 1: Setup — discover config, verify tools + SSH
   # ──────────────────────────────────────────────
   setup:
     runs-on: ubuntu-latest
@@ -35,6 +35,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Nix package manager
+        uses: cachix/install-nix-action@v30
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
 
       - name: Read cluster configuration from repo
         id: config
@@ -58,20 +63,27 @@ jobs:
           echo "Discovered child clusters: ${CHILD_CLUSTERS}"
           echo "K8s version: ${K8S_VERSION:-v1.29.2}"
 
-      - name: Install tools (sshpass, kubectl, Flux CLI, clusterctl)
+      - name: Install clusterctl (not available in nixpkgs)
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
-          curl -fsSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.29.2/bin/linux/amd64/kubectl
-          chmod +x /usr/local/bin/kubectl
-          curl -s https://fluxcd.io/install.sh | sudo bash
-          curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64 -o /usr/local/bin/clusterctl
+          curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64 \
+            -o /usr/local/bin/clusterctl
           chmod +x /usr/local/bin/clusterctl
+          clusterctl version --client
+
+      - name: Verify Nix-provided tooling
+        shell: nix-shell shell.nix --run "bash {0}"
+        run: |
+          echo "kubectl:  $(kubectl version --client --output=json | python3 -c 'import json,sys; print(json.load(sys.stdin)["clientVersion"]["gitVersion"])')"
+          echo "flux:     $(flux --version | head -1)"
+          echo "sshpass:  $(sshpass -V 2>&1 | head -1)"
 
       - name: Test SSH connectivity to VPS
+        shell: nix-shell shell.nix --run "bash {0}"
         env:
           SSHPASS: ${{ secrets.PASSWORD }}
         run: |
-          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" "echo SSH_OK && uname -a && free -h"
+          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" \
+            "echo 'SSH_OK — $(uname -a) — $(free -h | head -1)'"
 
   # ──────────────────────────────────────────────
   # JOB 2: Deploy — ensure K3s, Docker, Flux, CAPI on VPS
@@ -84,15 +96,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install tools (kubectl, Flux CLI, clusterctl)
+      - name: Install Nix package manager
+        uses: cachix/install-nix-action@v30
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Install clusterctl (not available in nixpkgs)
         run: |
-          curl -fsSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.29.2/bin/linux/amd64/kubectl
-          chmod +x /usr/local/bin/kubectl
-          curl -s https://fluxcd.io/install.sh | sudo bash
-          curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64 -o /usr/local/bin/clusterctl
+          curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64 \
+            -o /usr/local/bin/clusterctl
           chmod +x /usr/local/bin/clusterctl
 
       - name: Ensure K3s management cluster is running
+        shell: nix-shell shell.nix --run "bash {0}"
         env:
           SSHPASS: ${{ secrets.PASSWORD }}
         run: |
@@ -116,6 +132,7 @@ jobs:
           REMOTE
 
       - name: Ensure Docker is installed (required by CAPD)
+        shell: nix-shell shell.nix --run "bash {0}"
         env:
           SSHPASS: ${{ secrets.PASSWORD }}
         run: |
@@ -131,6 +148,7 @@ jobs:
           REMOTE
 
       - name: Retrieve management kubeconfig
+        shell: nix-shell shell.nix --run "bash {0}"
         env:
           SSHPASS: ${{ secrets.PASSWORD }}
         run: |
@@ -142,18 +160,22 @@ jobs:
           echo "Management kubeconfig retrieved"
 
       - name: Bootstrap Flux on management cluster
+        shell: nix-shell shell.nix --run "bash {0}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          BRANCH="${GITHUB_REF_NAME:-main}"
           flux bootstrap git \
             --url=https://github.com/${GITHUB_REPOSITORY}.git \
-            --branch="${GITHUB_REF_NAME:-main}" \
+            --branch="${BRANCH}" \
             --path=./clusters/management \
             --token-auth \
+            --password="$GITHUB_TOKEN" \
             --silent
 
       - name: Install Cluster API with Docker provider (CAPD)
+        shell: nix-shell shell.nix --run "bash {0}"
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
           echo "Initializing CAPI with Docker provider..."
@@ -164,6 +186,7 @@ jobs:
           kubectl get pods -A | grep -E "capi|capd|NAME"
 
       - name: Trigger Flux to reconcile latest manifest changes
+        shell: nix-shell shell.nix --run "bash {0}"
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
           kubectl annotate --overwrite gitrepository/flux-system -n flux-system \
@@ -195,14 +218,21 @@ jobs:
           name: mgmt-kubeconfig
           path: /tmp/kubeconfigs/
 
-      - name: Install tools (kubectl, clusterctl)
+      - uses: actions/checkout@v4
+
+      - name: Install Nix package manager
+        uses: cachix/install-nix-action@v30
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Install clusterctl (not available in nixpkgs)
         run: |
-          curl -fsSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.29.2/bin/linux/amd64/kubectl
-          chmod +x /usr/local/bin/kubectl
-          curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64 -o /usr/local/bin/clusterctl
+          curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64 \
+            -o /usr/local/bin/clusterctl
           chmod +x /usr/local/bin/clusterctl
 
       - name: Wait for ${{ matrix.cluster }} to provision and retrieve kubeconfig
+        shell: nix-shell shell.nix --run "bash {0}"
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
           echo "⏳ Waiting for ${{ matrix.cluster }} to become Provisioned (up to 5 min)..."
