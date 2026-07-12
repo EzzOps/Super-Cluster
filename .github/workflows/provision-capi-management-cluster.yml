@@ -152,7 +152,7 @@ jobs:
       - name: Bootstrap Flux (idempotent)
         shell: nix-shell shell.nix --run "bash {0}"
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
           flux bootstrap git \
