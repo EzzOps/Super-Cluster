@@ -175,20 +175,28 @@ jobs:
             --dry-run=client -o yaml | kubectl apply -f -
           echo "✅ Git secret 'flux-system' created/updated"
 
-      # ── 6. FluxInstance (declarative Flux management) ──
+      # ── 6. FluxInstance + Debug ──
       - name: Apply FluxInstance (declarative Flux desired state)
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
           kubectl apply -f clusters/management/flux-operator/flux-instance.yaml
           echo "✅ FluxInstance applied"
+          echo ""
+          echo "=== FluxInstance status ==="
+          kubectl get fluxinstance/supercluster -n flux-system -o yaml || echo "  (no status yet)"
+          echo ""
+          echo "=== Flux Operator logs (last 30 lines) ==="
+          kubectl logs -n flux-system deployment/flux-operator --tail=30 2>/dev/null || echo "  (no logs yet)"
+          echo ""
+          echo "=== Flux Operator events ==="
+          kubectl get events -n flux-system --field-selector involvedObject.kind=Deployment,involvedObject.name=flux-operator --sort-by=.lastTimestamp 2>/dev/null | tail -10 || true
 
       - name: Wait for Flux to be fully reconciled
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
           echo "⏳ Waiting for Flux controllers to deploy (up to 5 min)..."
-          echo "  (first run pulls Flux operator manifests — may take 2-4 min)"
           for i in $(seq 1 30); do
             READY=$(kubectl get fluxinstance/supercluster -n flux-system \
               -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
@@ -201,8 +209,28 @@ jobs:
             else
               echo "  Waiting for Flux controllers... (retry $i/30)"
             fi
+            # Every 10 retries, log operator status for debugging
+            if [ $((i % 10)) -eq 0 ]; then
+              echo "  --- operator logs ---"
+              kubectl logs -n flux-system deployment/flux-operator --tail=5 2>/dev/null || true
+              echo "  --- fluxinstance status ---"
+              kubectl get fluxinstance/supercluster -n flux-system \
+                -o jsonpath='{.status.conditions[*].message}' 2>/dev/null || true
+              echo ""
+            fi
             sleep 10
           done
+
+          # Fail if no Flux controllers appeared
+          if ! kubectl get deployment source-controller -n flux-system &>/dev/null; then
+            echo "❌ Flux controllers were never deployed by the operator!"
+            echo "=== Flux Operator logs ==="
+            kubectl logs -n flux-system deployment/flux-operator --tail=50 2>/dev/null || true
+            echo ""
+            echo "=== FluxInstance full status ==="
+            kubectl get fluxinstance/supercluster -n flux-system -o yaml 2>/dev/null || true
+            exit 1
+          fi
 
           # Wait for source-controller to be available
           echo "  Waiting for source-controller to be Available..."
