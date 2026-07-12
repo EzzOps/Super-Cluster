@@ -11,13 +11,85 @@ spec:
     services:
       cidrBlocks:
         - 10.96.0.0/12
-  topology:
-    class: quick-start
-    version: v1.36.2
-    controlPlane:
-      replicas: 1
-    workers:
-      machineDeployments:
-        - class: default-worker
-          name: md-0
-          replicas: 1
+  controlPlaneRef:
+    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+    kind: KubeadmControlPlane
+    name: child-2-control-plane
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+    kind: DockerCluster
+    name: child-2
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: DockerCluster
+metadata:
+  name: child-2
+  namespace: default
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: KubeadmControlPlane
+metadata:
+  name: child-2-control-plane
+  namespace: default
+spec:
+  replicas: 1
+  version: v1.29.2
+  machineTemplate:
+    infrastructureRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+      kind: DockerMachineTemplate
+      name: child-2-control-plane
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: DockerMachineTemplate
+metadata:
+  name: child-2-control-plane
+  namespace: default
+spec:
+  template:
+    spec: {}
+---
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineDeployment
+metadata:
+  name: child-2-md-0
+  namespace: default
+spec:
+  clusterName: child-2
+  replicas: 1
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: child-2
+  template:
+    metadata:
+      labels:
+        cluster.x-k8s.io/cluster-name: child-2
+    spec:
+      bootstrap:
+        configRef:
+          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+          kind: KubeadmConfigTemplate
+          name: child-2-md-0
+      clusterName: child-2
+      infrastructureRef:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+        kind: DockerMachineTemplate
+        name: child-2-md-0
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: DockerMachineTemplate
+metadata:
+  name: child-2-md-0
+  namespace: default
+spec:
+  template:
+    spec: {}
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+kind: KubeadmConfigTemplate
+metadata:
+  name: child-2-md-0
+  namespace: default
+spec:
+  template:
+    spec: {}
