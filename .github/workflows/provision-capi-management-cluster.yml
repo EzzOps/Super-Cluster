@@ -1,4 +1,4 @@
-name: Provision persistent Super-Cluster on VPS
+name: Manage Management Cluster (desired state)
 
 on:
   push:
@@ -22,72 +22,59 @@ env:
     -o LogLevel=ERROR
 
 jobs:
-  # ──────────────────────────────────────────────
-  # JOB 1: Setup — discover config, verify tools + SSH
-  # ──────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────
+  # JOB 1: Setup — config discovery, Nix tooling, SSH check
+  # ─────────────────────────────────────────────────────────
   setup:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       child_clusters: ${{ steps.config.outputs.child_clusters }}
       k8s_version: ${{ steps.config.outputs.k8s_version }}
-      matrix: ${{ steps.config.outputs.matrix }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Nix package manager
-        uses: cachix/install-nix-action@v30
+      - uses: cachix/install-nix-action@v30
         with:
           nix_path: nixpkgs=channel:nixos-unstable
 
-      - name: Read cluster configuration from repo
+      - name: Discover cluster config from repo
         id: config
         run: |
-          # Dynamically discover child clusters from repo
           CHILD_CLUSTERS=$(ls -d clusters/child/*/ 2>/dev/null | xargs -I{} basename {} | tr '\n' ' ')
           CHILD_CLUSTERS="${CHILD_CLUSTERS:-child-1 child-2}"
           echo "child_clusters=${CHILD_CLUSTERS}" >> $GITHUB_OUTPUT
 
-          # Read K8s version from child cluster manifests
           K8S_VERSION=$(grep -h 'version: v' clusters/child/*/cluster.yaml 2>/dev/null | head -1 | awk '{print $2}')
           echo "k8s_version=${K8S_VERSION:-v1.29.2}" >> $GITHUB_OUTPUT
 
-          # Build JSON matrix for parallel child cluster validation
-          MATRIX_JSON='{"cluster": []}'
-          if command -v jq &>/dev/null; then
-            MATRIX_JSON=$(echo "$CHILD_CLUSTERS" | tr ' ' '\n' | jq -R -s -c '{cluster: [.] | map(select(length > 0))}')
-          fi
-          echo "matrix=${MATRIX_JSON}" >> $GITHUB_OUTPUT
+          echo "Discovered: ${CHILD_CLUSTERS} @ ${K8S_VERSION:-v1.29.2}"
 
-          echo "Discovered child clusters: ${CHILD_CLUSTERS}"
-          echo "K8s version: ${K8S_VERSION:-v1.29.2}"
-
-      - name: Install clusterctl (not available in nixpkgs)
+      - name: Install clusterctl (not in nixpkgs)
         run: |
           curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64 \
             -o /usr/local/bin/clusterctl
           chmod +x /usr/local/bin/clusterctl
           clusterctl version
 
-      - name: Verify Nix-provided tooling
+      - name: Verify Nix-provided tools
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
-          echo "kubectl:  $(kubectl version --client --output=json | python3 -c 'import json,sys; print(json.load(sys.stdin)["clientVersion"]["gitVersion"])')"
-          echo "flux:     $(flux --version | head -1)"
-          echo "sshpass:  $(sshpass -V 2>&1 | head -1)"
+          echo "kubectl: $(kubectl version --client --output=json | python3 -c 'import json,sys; print(json.load(sys.stdin)["clientVersion"]["gitVersion"])')"
+          echo "flux:    $(flux --version | head -1)"
+          echo "sshpass: $(sshpass -V 2>&1 | head -1)"
 
-      - name: Test SSH connectivity to VPS
+      - name: Verify SSH connectivity to VPS
         shell: nix-shell shell.nix --run "bash {0}"
         env:
           SSHPASS: ${{ secrets.PASSWORD }}
         run: |
-          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" \
-            "echo 'SSH_OK — $(uname -a) — $(free -h | head -1)'"
+          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" "echo SSH_OK"
 
-  # ──────────────────────────────────────────────
-  # JOB 2: Deploy — ensure K3s, Docker, Flux, CAPI on VPS
-  # ──────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────
+  # JOB 2: Deploy — reconcile management cluster desired state
+  # ─────────────────────────────────────────────────────────
   deploy:
     runs-on: ubuntu-latest
     needs: setup
@@ -96,18 +83,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Nix package manager
-        uses: cachix/install-nix-action@v30
+      - uses: cachix/install-nix-action@v30
         with:
           nix_path: nixpkgs=channel:nixos-unstable
 
-      - name: Install clusterctl (not available in nixpkgs)
+      - name: Install clusterctl (not in nixpkgs)
         run: |
           curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64 \
             -o /usr/local/bin/clusterctl
           chmod +x /usr/local/bin/clusterctl
+          clusterctl version
 
-      - name: Ensure K3s management cluster is running
+      # ── 1. K3s management cluster ──
+      - name: Ensure K3s is running
         shell: nix-shell shell.nix --run "bash {0}"
         env:
           SSHPASS: ${{ secrets.PASSWORD }}
@@ -115,12 +103,13 @@ jobs:
           sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" bash -s <<'REMOTE'
           set -euo pipefail
           if command -v k3s >/dev/null 2>&1 && systemctl is-active --quiet k3s; then
-            echo "K3s management cluster already running"
+            echo "K3s already running — desired state met"
           else
-            echo "Installing K3s management cluster..."
+            echo "Installing K3s..."
             curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode=644" sh -
             systemctl enable --now k3s
           fi
+          # Wait for readiness
           for i in $(seq 1 30); do
             if kubectl get nodes --no-headers 2>/dev/null | grep -q Ready; then
               echo "K3s ready after ${i}s"
@@ -131,22 +120,23 @@ jobs:
           kubectl get nodes -o wide
           REMOTE
 
-      - name: Ensure Docker is installed (required by CAPD)
+      # ── 2. Docker (CAPD dependency) ──
+      - name: Ensure Docker is installed
         shell: nix-shell shell.nix --run "bash {0}"
         env:
           SSHPASS: ${{ secrets.PASSWORD }}
         run: |
           sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" bash -s <<'REMOTE'
           set -euo pipefail
-          if ! command -v docker >/dev/null 2>&1; then
-            echo "Installing Docker..."
-            curl -fsSL https://get.docker.com | sh
+          if command -v docker >/dev/null 2>&1; then
+            echo "Docker already installed — desired state met"
           else
-            echo "Docker already installed"
+            curl -fsSL https://get.docker.com | sh
           fi
           docker version
           REMOTE
 
+      # ── 3. Kubeconfig ──
       - name: Retrieve management kubeconfig
         shell: nix-shell shell.nix --run "bash {0}"
         env:
@@ -157,137 +147,61 @@ jobs:
             'sudo cat /etc/rancher/k3s/k3s.yaml' > /tmp/kubeconfigs/mgmt.yaml
           sed -i "s/127.0.0.1/${{ secrets.HOST }}/g" /tmp/kubeconfigs/mgmt.yaml
           chmod 600 /tmp/kubeconfigs/mgmt.yaml
-          echo "Management kubeconfig retrieved"
 
-      - name: Bootstrap Flux on management cluster
+      # ── 4. Flux ──
+      - name: Bootstrap Flux (idempotent)
         shell: nix-shell shell.nix --run "bash {0}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          BRANCH="${GITHUB_REF_NAME:-main}"
           flux bootstrap git \
             --url=https://github.com/${GITHUB_REPOSITORY}.git \
-            --branch="${BRANCH}" \
+            --branch="${GITHUB_REF_NAME:-main}" \
             --path=./clusters/management \
             --token-auth \
             --password="$GITHUB_TOKEN" \
             --silent
 
-      - name: Install Cluster API with Docker provider (CAPD)
+      # ── 5. Cluster API (CAPD) ──
+      - name: Install Cluster API with Docker provider (idempotent)
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          echo "Initializing CAPI with Docker provider..."
           clusterctl init --infrastructure docker
           kubectl wait --for=condition=Available deployment/capi-controller-manager -n capi-system --timeout=3m 2>/dev/null || true
           kubectl wait --for=condition=Available deployment/capd-controller-manager -n capd-system --timeout=3m 2>/dev/null || true
-          echo "=== CAPI / CAPD pods ==="
-          kubectl get pods -A | grep -E "capi|capd|NAME"
+          echo "=== CAPI / CAPD state ==="
+          kubectl get pods -n capi-system -n capd-system 2>/dev/null | grep -E "capi|capd|NAME"
+          echo ""
+          echo "✅ Management cluster desired state applied"
 
-      - name: Trigger Flux to reconcile latest manifest changes
+      # ── 6. Trigger Flux (so it picks up any new child manifests) ──
+      - name: Trigger Flux reconcile
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
           kubectl annotate --overwrite gitrepository/flux-system -n flux-system \
             flux.fluxcd.io/reconcileAt="$(date +%s)"
-          echo "Flux reconcile triggered — CAPI will create/update child clusters declaratively"
+          echo "Flux reconcile triggered — GitRepository polling at 1m interval"
+          echo ""
+          echo "Child clusters are CREATED/MANAGED by Flux + CAPI on-cluster."
+          echo "The GitRepository in clusters/management/flux-system/gotk-sync.yaml"
+          echo "polls every 1m, applies clusters/child/ manifests → CAPI provisions."
+          echo ""
+          echo "This workflow only manages the management cluster's desired state."
 
-      - name: Upload management kubeconfig for downstream jobs
-        uses: actions/upload-artifact@v4
-        with:
-          name: mgmt-kubeconfig
-          path: /tmp/kubeconfigs/mgmt.yaml
-          retention-days: 1
-          if-no-files-found: error
-
-  # ──────────────────────────────────────────────
-  # JOB 3: Validate — wait for each child cluster (parallel matrix)
-  # ──────────────────────────────────────────────
-  validate:
-    runs-on: ubuntu-latest
-    needs: [setup, deploy]
-    timeout-minutes: 10
-    strategy:
-      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
-
-    steps:
-      - name: Download management kubeconfig
-        uses: actions/download-artifact@v4
-        with:
-          name: mgmt-kubeconfig
-          path: /tmp/kubeconfigs/
-
-      - uses: actions/checkout@v4
-
-      - name: Install Nix package manager
-        uses: cachix/install-nix-action@v30
-        with:
-          nix_path: nixpkgs=channel:nixos-unstable
-
-      - name: Install clusterctl (not available in nixpkgs)
-        run: |
-          curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64 \
-            -o /usr/local/bin/clusterctl
-          chmod +x /usr/local/bin/clusterctl
-
-      - name: Wait for ${{ matrix.cluster }} to provision and retrieve kubeconfig
-        shell: nix-shell shell.nix --run "bash {0}"
-        run: |
-          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          echo "⏳ Waiting for ${{ matrix.cluster }} to become Provisioned (up to 5 min)..."
-          PROVISIONED=false
-          for i in $(seq 1 30); do
-            phase=$(kubectl get cluster "${{ matrix.cluster }}" -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-            if [ "$phase" = "Provisioned" ]; then
-              echo "✅ ${{ matrix.cluster }} is Provisioned after ~$((i * 10))s"
-              PROVISIONED=true
-              break
-            fi
-            echo "  ${{ matrix.cluster }} phase: ${phase:-N/A} (retry $i/30 in 10s)..."
-            sleep 10
-          done
-
-          if [ "$PROVISIONED" = "true" ]; then
-            clusterctl get kubeconfig "${{ matrix.cluster }}" -n default > "/tmp/kubeconfigs/${{ matrix.cluster }}.yaml" 2>/dev/null || true
-            if [ -s "/tmp/kubeconfigs/${{ matrix.cluster }}.yaml" ]; then
-              echo "  ✅ Retrieved kubeconfig for ${{ matrix.cluster }}"
-              kubectl create secret generic "kubeconfig-${{ matrix.cluster }}" -n flux-system \
-                --from-file=value="/tmp/kubeconfigs/${{ matrix.cluster }}.yaml" \
-                --dry-run=client -o yaml | kubectl apply -f -
-              echo "  ✅ Imported kubeconfig-${{ matrix.cluster }} into Flux"
-            else
-              echo "  ⚠️ kubeconfig file empty or retrieval failed"
-            fi
-          else
-            echo "❌ ${{ matrix.cluster }} did not reach Provisioned within timeout"
-          fi
-
-  # ──────────────────────────────────────────────
-  # JOB 4: Report — summary of everything deployed
-  # ──────────────────────────────────────────────
-  report:
-    runs-on: ubuntu-latest
-    needs: [setup, deploy, validate]
-    if: always()
-    timeout-minutes: 2
-
-    steps:
-      - name: Deployment summary
+      # ── 7. Summary ──
+      - name: Summary
         run: |
           echo "================================================"
-          echo "  Super-Cluster GitOps pipeline complete"
+          echo "  Management cluster desired state applied ✓"
           echo "================================================"
-          echo "  ! Fully idempotent — safe to re-run"
-          echo "  ! Changes via YAML edits only"
-          echo "  ! Flux + CAPI reconcile loop active (every 1m)"
-          echo "================================================"
-          echo "  Management:    K3s (CAPI via clusterctl)"
+          echo "  Components: K3s + Flux + CAPI (CAPD)"
           echo "  Child clusters: ${{ needs.setup.outputs.child_clusters }}"
-          echo "  Kubernetes:    ${{ needs.setup.outputs.k8s_version }}"
+          echo "  Kubernetes:     ${{ needs.setup.outputs.k8s_version }}"
           echo "================================================"
-          echo "  To add a new child cluster:"
-          echo "    1. Create clusters/child/<name>/cluster.yaml"
-          echo "    2. Push to main"
-          echo "    3. Flux + CAPI auto-provisions"
+          echo "  Flux on-cluster polls for child cluster changes"
+          echo "  To add a child: git push a new cluster.yaml"
+          echo "  Flux + CAPI auto-provisions on the VPS"
           echo "================================================"
