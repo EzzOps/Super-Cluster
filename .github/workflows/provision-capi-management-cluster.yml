@@ -42,8 +42,8 @@ jobs:
           CHILD_CLUSTERS="${CHILD_CLUSTERS:-child-1 child-2}"
           echo "child_clusters=${CHILD_CLUSTERS}" >> $GITHUB_OUTPUT
           K8S_VERSION=$(grep -h 'version: v' clusters/child/*/cluster.yaml 2>/dev/null | head -1 | awk '{print $2}')
-          echo "k8s_version=${K8S_VERSION:-v1.29.2}" >> $GITHUB_OUTPUT
-          echo "Discovered: ${CHILD_CLUSTERS} @ ${K8S_VERSION:-v1.29.2}"
+          echo "k8s_version=${K8S_VERSION:-v1.36.2}" >> $GITHUB_OUTPUT
+          echo "Discovered: ${CHILD_CLUSTERS} @ ${K8S_VERSION:-v1.36.2}"
 
       - name: Verify tools
         shell: nix-shell shell.nix --run "bash {0}"
@@ -68,11 +68,11 @@ jobs:
         with:
           nix_path: nixpkgs=channel:nixos-unstable
 
-      # ── 0. Clusterctl + flux-operator CLI (not in nixpkgs) ──
+      # ── 0. clusterctl + flux-operator CLI ──
       - name: Install CLI tools (clusterctl + flux-operator)
         run: |
-          # clusterctl
-          curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64 -o /usr/local/bin/clusterctl
+          # clusterctl v1.13.3 (ClusterTopology enabled by default)
+          curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.13.3/clusterctl-linux-amd64 -o /usr/local/bin/clusterctl
           chmod +x /usr/local/bin/clusterctl
           # flux-operator CLI
           curl -sL https://github.com/controlplaneio-fluxcd/flux-operator/releases/download/v0.54.1/flux-operator_0.54.1_linux_amd64.tar.gz -o /tmp/flux-op.tar.gz
@@ -81,7 +81,7 @@ jobs:
           echo "clusterctl: $(clusterctl version 2>&1 | head -1)"
           echo "flux-operator: $(flux-operator version 2>&1 | head -1)"
 
-      # ── 1. K3s (imperative — must SSH into VPS) ──
+      # ── 1. K3s ──
       - name: Ensure K3s is running
         shell: nix-shell shell.nix --run "bash {0}"
         env:
@@ -90,7 +90,7 @@ jobs:
           sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" bash -s <<'REMOTE'
           set -euo pipefail
           if command -v k3s >/dev/null 2>&1 && systemctl is-active --quiet k3s; then
-            echo "K3s already running — desired state met"
+            echo "K3s already running"
           else
             curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode=644" sh -
             systemctl enable --now k3s
@@ -120,11 +120,39 @@ jobs:
           SSHPASS: ${{ secrets.PASSWORD }}
         run: |
           mkdir -p /tmp/kubeconfigs
-          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" \
-            'sudo cat /etc/rancher/k3s/k3s.yaml' > /tmp/kubeconfigs/mgmt.yaml
+          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}"             'sudo cat /etc/rancher/k3s/k3s.yaml' > /tmp/kubeconfigs/mgmt.yaml
           sed -i "s/127.0.0.1/${{ secrets.HOST }}/g" /tmp/kubeconfigs/mgmt.yaml
 
-      # ── 4. Create Git auth secret (injected before Flux bootstrap) ──
+      # ── 4. Install CAPI BEFORE Flux (CRDs must exist for Cluster resources) ──
+      - name: Install Cluster API (CAPD)
+        shell: nix-shell shell.nix --run "bash {0}"
+        run: |
+          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          echo "Installing CAPI v1.13.3 with Docker provider..."
+          clusterctl init --infrastructure docker 2>&1 || true
+          echo ""
+          echo "Waiting for CAPI controllers..."
+          kubectl wait --for=condition=Available deployment/capi-controller-manager -n capi-system --timeout=5m 2>/dev/null || true
+          kubectl wait --for=condition=Available deployment/capd-controller-manager -n capd-system --timeout=5m 2>/dev/null || true
+          echo ""
+          echo "=== CAPI pods ==="
+          kubectl get pods -A | grep -E "capi|capd|NAME" 2>/dev/null
+
+      # ── 5. Apply ClusterClass (must exist before Cluster resources) ──
+      - name: Apply ClusterClass for CAPD
+        shell: nix-shell shell.nix --run "bash {0}"
+        run: |
+          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          echo "Applying ClusterClass 'quick-start'..."
+          kubectl apply -f clusters/management/clusterclass.yaml
+          echo ""
+          echo "=== ClusterClass ==="
+          kubectl get clusterclass 2>/dev/null || echo "(no ClusterClass yet)"
+          echo ""
+          echo "=== Templates ==="
+          kubectl get kubeadmcontrolplanetemplate,dockerclustertemplate,dockermachinetemplate,kubeadmconfigtemplate -A 2>/dev/null || echo "(templates pending)"
+
+      # ── 6. Create Git auth secret ──
       - name: Create Git authentication secret
         shell: nix-shell shell.nix --run "bash {0}"
         env:
@@ -134,22 +162,19 @@ jobs:
           envsubst < clusters/management/flux-operator/git-secret.yaml | kubectl apply -f -
           echo "✅ Git secret injected"
 
-      # ── 5. Bootstrap Flux via flux-operator CLI ──
+      # ── 7. Bootstrap Flux (CRDs + ClusterClass now exist) ──
       - name: Bootstrap Flux (operator + FluxInstance)
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          # Remove old operator deployment if present (CLI can't upgrade it due to immutable selector)
           kubectl delete deployment flux-operator -n flux-system --ignore-not-found 2>/dev/null || true
-          # The CLI installs the operator (if needed) then deploys Flux from the config
           flux-operator install -f clusters/management/flux-operator/flux-instance.yaml || true
-          echo ""
 
       - name: Wait for Flux controllers to be ready
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          echo "⏳ Waiting for Flux controllers (up to 5 min for first image pull)..."
+          echo "⏳ Waiting for Flux controllers..."
           for i in $(seq 1 30); do
             if kubectl get deployment source-controller -n flux-system &>/dev/null 2>&1; then
               echo "  source-controller appearing after $((i * 10))s"
@@ -171,24 +196,28 @@ jobs:
           kubectl apply -f clusters/management/flux-operator/flux-web-nodeport.yaml
           echo "✅ Web UI exposed on http://${{ secrets.HOST }}:30080"
 
-      # ── 6. Install CAPI (Flux already bootstrapped by CLI above) ──
-      - name: Install Cluster API (CAPD)
+      - name: Force Flux reconcile to apply Cluster resources
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          clusterctl init --infrastructure docker 2>&1 || true
-          kubectl wait --for=condition=Available deployment/capi-controller-manager -n capi-system --timeout=3m 2>/dev/null || true
-          kubectl wait --for=condition=Available deployment/capd-controller-manager -n capd-system --timeout=3m 2>/dev/null || true
+          kubectl annotate --overwrite gitrepository/flux-system -n flux-system             flux.fluxcd.io/reconcileAt="$(date +%s)"
+          echo "Flux reconcile triggered"
+          sleep 15
+          echo ""
+          echo "=== CAPI Cluster state ==="
+          kubectl get clusters -A -o wide 2>/dev/null || echo "No clusters yet"
+          kubectl get clusterclass 2>/dev/null || echo "No ClusterClass yet"
 
       - name: Summary
         run: |
           echo "================================================"
           echo "  Management cluster desired state applied ✓"
           echo "================================================"
-          echo "  Components: K3s + Flux Operator + CAPI"
-          echo "  Flux UI:    http://${{ secrets.HOST }}:30080"
-          echo "  Children:   ${{ needs.setup.outputs.child_clusters }}"
-          echo "  K8s:        ${{ needs.setup.outputs.k8s_version }}"
+          echo "  Components: K3s + Flux Operator + CAPI v1.13.3"
+          echo "  CAPI version: v1.13.3 (ClusterTopology=beta, enabled)"
+          echo "  K8s version:  ${{ needs.setup.outputs.k8s_version }}"
+          echo "  Flux UI:      http://${{ secrets.HOST }}:30080"
+          echo "  Children:     ${{ needs.setup.outputs.child_clusters }}"
           echo "================================================"
           echo "  All declarative YAML in clusters/management/"
           echo "  Add child: git push clusters/child/<name>/"
