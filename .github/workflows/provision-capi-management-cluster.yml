@@ -141,15 +141,14 @@ jobs:
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
 
-          # Clean up old flux bootstrap (if present) to avoid conflicts
-          if kubectl get gitrepository flux-system -n flux-system &>/dev/null; then
-            echo "Old flux bootstrap detected — cleaning up..."
+          # Clean up old flux bootstrap (if present) — uninstall controllers only
+          if kubectl get gitrepository flux-system -n flux-system &>/dev/null 2>&1; then
+            echo "Old flux bootstrap detected — cleaning up controllers..."
             flux uninstall --silent 2>/dev/null || true
-            kubectl delete namespace flux-system --ignore-not-found 2>/dev/null || true
+            sleep 10  # wait for deployments to terminate
           fi
 
-          # Recreate namespace and install Flux Operator
-          kubectl create namespace flux-system --dry-run=client -o yaml | kubectl apply -f -
+          # Install Flux Operator (idempotent)
           kubectl apply -f https://github.com/controlplaneio-fluxcd/flux-operator/releases/download/v0.54.1/install.yaml
 
           echo "Waiting for Flux Operator to be ready..."
@@ -182,16 +181,33 @@ jobs:
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
           echo "⏳ Waiting for FluxInstance to reconcile (up to 3 min)..."
-          # The FluxInstance CRD reports status via Ready condition
-          kubectl wait --for=condition=Ready fluxinstance/supercluster -n flux-system --timeout=3m 2>/dev/null || \
-            kubectl wait --for=condition=Available deployment/source-controller -n flux-system --timeout=3m
-          echo "✅ Flux is running and syncing from repo"
+          # FluxInstance might use 'Ready' or 'Available' condition
+          for i in $(seq 1 18); do
+            READY=$(kubectl get fluxinstance/supercluster -n flux-system \
+              -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+            if [ "$READY" = "True" ]; then
+              echo "✅ FluxInstance Ready after ~$((i * 10))s"
+              break
+            fi
+            # Check if source-controller is up (partial readiness)
+            if kubectl get deployment source-controller -n flux-system &>/dev/null; then
+              echo "  Flux controllers deploying... (retry $i/18)"
+            else
+              echo "  Waiting for Flux controllers... (retry $i/18)"
+            fi
+            sleep 10
+          done
+
+          # Wait for source controller to be fully available
+          kubectl wait --for=condition=Available deployment/source-controller -n flux-system --timeout=3m 2>/dev/null || \
+            kubectl wait --for=condition=Available deployment/kustomize-controller -n flux-system --timeout=3m 2>/dev/null || true
+
           echo ""
           echo "=== Flux components ==="
-          kubectl get pods -n flux-system | grep -E "source|kustomize|helm|notification|NAME"
+          kubectl get pods -n flux-system | grep -E "source|kustomize|helm|notification|NAME" 2>/dev/null || echo "  (no flux pods yet)"
           echo ""
           echo "=== GitRepository ==="
-          kubectl get gitrepository -n flux-system -o wide 2>/dev/null
+          kubectl get gitrepository -n flux-system -o wide 2>/dev/null || echo "  (no git repo yet)"
 
       # ── 7. Web UI access ──
       - name: Expose Flux Web UI via NodePort
