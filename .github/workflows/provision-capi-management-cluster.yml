@@ -22,9 +22,9 @@ env:
     -o LogLevel=ERROR
 
 jobs:
-  # ─────────────────────────────────────────────────────────
-  # JOB 1: Setup — config discovery, Nix tooling, SSH check
-  # ─────────────────────────────────────────────────────────
+  # ──────────────────────────────────────────────
+  # JOB 1: Setup — config discovery, Nix, SSH check
+  # ──────────────────────────────────────────────
   setup:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -51,13 +51,6 @@ jobs:
 
           echo "Discovered: ${CHILD_CLUSTERS} @ ${K8S_VERSION:-v1.29.2}"
 
-      - name: Install clusterctl (not in nixpkgs)
-        run: |
-          curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64 \
-            -o /usr/local/bin/clusterctl
-          chmod +x /usr/local/bin/clusterctl
-          clusterctl version
-
       - name: Verify Nix-provided tools
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
@@ -72,9 +65,9 @@ jobs:
         run: |
           sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" "echo SSH_OK"
 
-  # ─────────────────────────────────────────────────────────
+  # ──────────────────────────────────────────────
   # JOB 2: Deploy — reconcile management cluster desired state
-  # ─────────────────────────────────────────────────────────
+  # ──────────────────────────────────────────────
   deploy:
     runs-on: ubuntu-latest
     needs: setup
@@ -86,13 +79,6 @@ jobs:
       - uses: cachix/install-nix-action@v30
         with:
           nix_path: nixpkgs=channel:nixos-unstable
-
-      - name: Install clusterctl (not in nixpkgs)
-        run: |
-          curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64 \
-            -o /usr/local/bin/clusterctl
-          chmod +x /usr/local/bin/clusterctl
-          clusterctl version
 
       # ── 1. K3s management cluster ──
       - name: Ensure K3s is running
@@ -109,7 +95,6 @@ jobs:
             curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode=644" sh -
             systemctl enable --now k3s
           fi
-          # Wait for readiness
           for i in $(seq 1 30); do
             if kubectl get nodes --no-headers 2>/dev/null | grep -q Ready; then
               echo "K3s ready after ${i}s"
@@ -147,23 +132,86 @@ jobs:
             'sudo cat /etc/rancher/k3s/k3s.yaml' > /tmp/kubeconfigs/mgmt.yaml
           sed -i "s/127.0.0.1/${{ secrets.HOST }}/g" /tmp/kubeconfigs/mgmt.yaml
           chmod 600 /tmp/kubeconfigs/mgmt.yaml
+          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          echo "Management kubeconfig retrieved"
 
-      # ── 4. Flux ──
-      - name: Bootstrap Flux (idempotent)
+      # ── 4. Flux Operator (replaces flux bootstrap) ──
+      - name: Install Flux Operator (manages Flux declaratively)
         shell: nix-shell shell.nix --run "bash {0}"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          flux bootstrap git \
-            --url=https://github.com/${GITHUB_REPOSITORY}.git \
-            --branch="${GITHUB_REF_NAME:-main}" \
-            --path=./clusters/management \
-            --token-auth \
-            --password="$GITHUB_TOKEN" \
-            --silent
 
-      # ── 5. Cluster API (CAPD) ──
+          # Clean up old flux bootstrap (if present) to avoid conflicts
+          if kubectl get gitrepository flux-system -n flux-system &>/dev/null; then
+            echo "Old flux bootstrap detected — cleaning up..."
+            flux uninstall --silent 2>/dev/null || true
+            kubectl delete namespace flux-system --ignore-not-found 2>/dev/null || true
+          fi
+
+          # Recreate namespace and install Flux Operator
+          kubectl create namespace flux-system --dry-run=client -o yaml | kubectl apply -f -
+          kubectl apply -f https://github.com/controlplaneio-fluxcd/flux-operator/releases/download/v0.54.1/install.yaml
+
+          echo "Waiting for Flux Operator to be ready..."
+          kubectl wait --for=condition=Available deployment/flux-operator -n flux-system --timeout=3m
+          echo "✅ Flux Operator installed"
+
+      # ── 5. Git credentials secret ──
+      - name: Create Git authentication secret
+        shell: nix-shell shell.nix --run "bash {0}"
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          kubectl create secret generic flux-system -n flux-system \
+            --from-literal=username=git \
+            --from-literal=password="$GH_TOKEN" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          echo "✅ Git secret 'flux-system' created/updated"
+
+      # ── 6. FluxInstance (declarative Flux management) ──
+      - name: Apply FluxInstance (declarative Flux desired state)
+        shell: nix-shell shell.nix --run "bash {0}"
+        run: |
+          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          kubectl apply -f clusters/management/flux-operator/flux-instance.yaml
+          echo "✅ FluxInstance applied"
+
+      - name: Wait for Flux to be fully reconciled
+        shell: nix-shell shell.nix --run "bash {0}"
+        run: |
+          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          echo "⏳ Waiting for FluxInstance to reconcile (up to 3 min)..."
+          # The FluxInstance CRD reports status via Ready condition
+          kubectl wait --for=condition=Ready fluxinstance/supercluster -n flux-system --timeout=3m 2>/dev/null || \
+            kubectl wait --for=condition=Available deployment/source-controller -n flux-system --timeout=3m
+          echo "✅ Flux is running and syncing from repo"
+          echo ""
+          echo "=== Flux components ==="
+          kubectl get pods -n flux-system | grep -E "source|kustomize|helm|notification|NAME"
+          echo ""
+          echo "=== GitRepository ==="
+          kubectl get gitrepository -n flux-system -o wide 2>/dev/null
+
+      # ── 7. Web UI access ──
+      - name: Expose Flux Web UI via NodePort
+        shell: nix-shell shell.nix --run "bash {0}"
+        run: |
+          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          kubectl apply -f clusters/management/flux-operator/flux-web-nodeport.yaml
+          echo "✅ Flux Web UI exposed on NodePort 30080"
+          echo ""
+          echo "Access the Flux UI at: http://${{ secrets.HOST }}:30080"
+          echo ""
+          echo "The Web UI gives you real-time visibility into:"
+          echo "  - Cluster dashboard (controller status, reconciliation activity)"
+          echo "  - GitOps pipeline graph (source → kustomization → workload)"
+          echo "  - Helm release dashboard with values and revision history"
+          echo "  - Pod log viewer with level detection and stack trace grouping"
+          echo "  - Real-time Kubernetes event viewer"
+          echo "  - Advanced resource search and favorites"
+
+      # ── 8. Cluster API (CAPD) ──
       - name: Install Cluster API with Docker provider (idempotent)
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
@@ -173,35 +221,19 @@ jobs:
           kubectl wait --for=condition=Available deployment/capd-controller-manager -n capd-system --timeout=3m 2>/dev/null || true
           echo "=== CAPI / CAPD state ==="
           kubectl get pods -n capi-system -n capd-system 2>/dev/null | grep -E "capi|capd|NAME"
-          echo ""
-          echo "✅ Management cluster desired state applied"
 
-      # ── 6. Trigger Flux (so it picks up any new child manifests) ──
-      - name: Trigger Flux reconcile
-        shell: nix-shell shell.nix --run "bash {0}"
-        run: |
-          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          kubectl annotate --overwrite gitrepository/flux-system -n flux-system \
-            flux.fluxcd.io/reconcileAt="$(date +%s)"
-          echo "Flux reconcile triggered — GitRepository polling at 1m interval"
-          echo ""
-          echo "Child clusters are CREATED/MANAGED by Flux + CAPI on-cluster."
-          echo "The GitRepository in clusters/management/flux-system/gotk-sync.yaml"
-          echo "polls every 1m, applies clusters/child/ manifests → CAPI provisions."
-          echo ""
-          echo "This workflow only manages the management cluster's desired state."
-
-      # ── 7. Summary ──
+      # ── 9. Summary ──
       - name: Summary
         run: |
           echo "================================================"
           echo "  Management cluster desired state applied ✓"
           echo "================================================"
-          echo "  Components: K3s + Flux + CAPI (CAPD)"
+          echo "  Components: K3s + Flux Operator + CAPI (CAPD)"
+          echo "  Flux UI:    http://${{ secrets.HOST }}:30080"
           echo "  Child clusters: ${{ needs.setup.outputs.child_clusters }}"
           echo "  Kubernetes:     ${{ needs.setup.outputs.k8s_version }}"
           echo "================================================"
-          echo "  Flux on-cluster polls for child cluster changes"
           echo "  To add a child: git push a new cluster.yaml"
-          echo "  Flux + CAPI auto-provisions on the VPS"
+          echo "  Flux + CAPI on-cluster auto-provisions"
+          echo "  Flux Operator manages Flux lifecycle"
           echo "================================================"
