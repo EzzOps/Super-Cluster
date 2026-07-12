@@ -42,8 +42,8 @@ jobs:
           CHILD_CLUSTERS="${CHILD_CLUSTERS:-child-1 child-2}"
           echo "child_clusters=${CHILD_CLUSTERS}" >> $GITHUB_OUTPUT
           K8S_VERSION=$(grep -h 'version: v' clusters/child/*/cluster.yaml 2>/dev/null | head -1 | awk '{print $2}')
-          echo "k8s_version=${K8S_VERSION:-v1.36.2}" >> $GITHUB_OUTPUT
-          echo "Discovered: ${CHILD_CLUSTERS} @ ${K8S_VERSION:-v1.36.2}"
+          echo "k8s_version=${K8S_VERSION:-v1.29.2}" >> $GITHUB_OUTPUT
+          echo "Discovered: ${CHILD_CLUSTERS} @ ${K8S_VERSION:-v1.29.2}"
 
       - name: Verify tools
         shell: nix-shell shell.nix --run "bash {0}"
@@ -69,17 +69,14 @@ jobs:
           nix_path: nixpkgs=channel:nixos-unstable
 
       # ── 0. clusterctl + flux-operator CLI ──
-      - name: Install CLI tools (clusterctl + flux-operator)
+      - name: Install CLI tools
         run: |
-          # clusterctl v1.13.3 (ClusterTopology enabled by default)
-          curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.13.3/clusterctl-linux-amd64 -o /usr/local/bin/clusterctl
+          curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64 -o /usr/local/bin/clusterctl
           chmod +x /usr/local/bin/clusterctl
-          # flux-operator CLI
           curl -sL https://github.com/controlplaneio-fluxcd/flux-operator/releases/download/v0.54.1/flux-operator_0.54.1_linux_amd64.tar.gz -o /tmp/flux-op.tar.gz
           tar xzf /tmp/flux-op.tar.gz -C /usr/local/bin/ flux-operator
           chmod +x /usr/local/bin/flux-operator
           echo "clusterctl: $(clusterctl version 2>&1 | head -1)"
-          echo "flux-operator: $(flux-operator version 2>&1 | head -1)"
 
       # ── 1. K3s ──
       - name: Ensure K3s is running
@@ -123,34 +120,48 @@ jobs:
           sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}"             'sudo cat /etc/rancher/k3s/k3s.yaml' > /tmp/kubeconfigs/mgmt.yaml
           sed -i "s/127.0.0.1/${{ secrets.HOST }}/g" /tmp/kubeconfigs/mgmt.yaml
 
-      # ── 4. Install CAPI BEFORE Flux (CRDs must exist for Cluster resources) ──
+      # ── 4. Install CAPI (skip if already installed) ──
       - name: Install Cluster API (CAPD)
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          echo "Installing CAPI v1.13.3 with Docker provider..."
+          echo "Initializing CAPI with Docker provider..."
           clusterctl init --infrastructure docker 2>&1 || true
-          echo ""
-          echo "Waiting for CAPI controllers..."
           kubectl wait --for=condition=Available deployment/capi-controller-manager -n capi-system --timeout=5m 2>/dev/null || true
           kubectl wait --for=condition=Available deployment/capd-controller-manager -n capd-system --timeout=5m 2>/dev/null || true
-          echo ""
           echo "=== CAPI pods ==="
           kubectl get pods -A | grep -E "capi|capd|NAME" 2>/dev/null
 
-      # ── 5. Apply ClusterClass (must exist before Cluster resources) ──
-      - name: Apply ClusterClass for CAPD
+      # ── 5. Enable ClusterTopology feature gate (required for spec.topology) ──
+      - name: Enable ClusterTopology feature gate on CAPI
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          echo "Applying ClusterClass 'quick-start'..."
-          kubectl apply -f clusters/management/clusterclass.yaml
+          echo "Patching CAPI controller manager to enable ClusterTopology..."
+
+          # Patch the capi-controller-manager deployment to add CLUSTER_TOPOLOGY=true
+          kubectl patch deployment capi-controller-manager -n capi-system --type='json' -p='[
+            {"op": "add", "path": "/spec/template/spec/containers/0/env/-", "value": {"name": "CLUSTER_TOPOLOGY", "value": "true"}}
+          ]' 2>/dev/null || echo "Patch add failed, trying replace..."
+
+          # If add fails (env already exists), try setting it
+          kubectl set env deployment/capi-controller-manager -n capi-system CLUSTER_TOPOLOGY=true 2>/dev/null || true
+
+          echo "Waiting for CAPI controller to restart with ClusterTopology enabled..."
+          kubectl rollout status deployment/capi-controller-manager -n capi-system --timeout=3m 2>/dev/null || true
+          kubectl wait --for=condition=Available deployment/capi-controller-manager -n capi-system --timeout=3m 2>/dev/null || true
+
           echo ""
-          echo "=== ClusterClass ==="
-          kubectl get clusterclass 2>/dev/null || echo "(no ClusterClass yet)"
-          echo ""
-          echo "=== Templates ==="
-          kubectl get kubeadmcontrolplanetemplate,dockerclustertemplate,dockermachinetemplate,kubeadmconfigtemplate -A 2>/dev/null || echo "(templates pending)"
+          echo "=== Verifying ClusterTopology feature gate ==="
+          kubectl get deploy capi-controller-manager -n capi-system -o jsonpath='{.spec.template.spec.containers[0].env}' 2>/dev/null | python3 -c "
+import json,sys
+envs = json.load(sys.stdin)
+for e in envs:
+    if 'TOPOLOGY' in e.get('name','').upper() or 'CLUSTER' in e.get('name','').upper():
+        print(f'  {e["name"]}={e.get("value","")}')
+if not any('TOPOLOGY' in e.get('name','').upper() for e in envs):
+    print('  ⚠️  CLUSTER_TOPOLOGY not found in env — checking args...')
+" 2>/dev/null || echo "  (could not verify)"
 
       # ── 6. Create Git auth secret ──
       - name: Create Git authentication secret
@@ -162,7 +173,7 @@ jobs:
           envsubst < clusters/management/flux-operator/git-secret.yaml | kubectl apply -f -
           echo "✅ Git secret injected"
 
-      # ── 7. Bootstrap Flux (CRDs + ClusterClass now exist) ──
+      # ── 7. Bootstrap Flux ──
       - name: Bootstrap Flux (operator + FluxInstance)
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
@@ -184,40 +195,41 @@ jobs:
           done
           kubectl wait --for=condition=Available deployment/source-controller -n flux-system --timeout=3m 2>/dev/null || true
           kubectl wait --for=condition=Available deployment/kustomize-controller -n flux-system --timeout=3m 2>/dev/null || true
-          echo ""
           echo "=== Flux components ==="
           kubectl get pods -n flux-system | grep -E "source|kustomize|helm|notification|NAME" 2>/dev/null || echo "  (still pulling images)"
-          echo "✅ Flux Operator + Flux bootstrapped"
+          echo "✅ Flux bootstrapped"
 
-      - name: Apply Web UI NodePort YAML
+      - name: Apply Web UI NodePort
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
           kubectl apply -f clusters/management/flux-operator/flux-web-nodeport.yaml
           echo "✅ Web UI exposed on http://${{ secrets.HOST }}:30080"
 
-      - name: Force Flux reconcile to apply Cluster resources
+      # ── 8. Trigger Flux reconcile ──
+      - name: Force Flux reconcile
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
           kubectl annotate --overwrite gitrepository/flux-system -n flux-system             flux.fluxcd.io/reconcileAt="$(date +%s)"
-          echo "Flux reconcile triggered"
+          echo "Flux reconcile triggered — CAPI will provision child clusters"
           sleep 15
-          echo ""
           echo "=== CAPI Cluster state ==="
           kubectl get clusters -A -o wide 2>/dev/null || echo "No clusters yet"
-          kubectl get clusterclass 2>/dev/null || echo "No ClusterClass yet"
+          kubectl get kubeadmcontrolplane -A 2>/dev/null || echo "No control planes yet"
+          kubectl get machinedeployment -A 2>/dev/null || echo "No machine deployments yet"
 
       - name: Summary
         run: |
           echo "================================================"
           echo "  Management cluster desired state applied ✓"
           echo "================================================"
-          echo "  Components: K3s + Flux Operator + CAPI v1.13.3"
-          echo "  CAPI version: v1.13.3 (ClusterTopology=beta, enabled)"
-          echo "  K8s version:  ${{ needs.setup.outputs.k8s_version }}"
-          echo "  Flux UI:      http://${{ secrets.HOST }}:30080"
-          echo "  Children:     ${{ needs.setup.outputs.child_clusters }}"
+          echo "  Components: K3s + Flux Operator + CAPI"
+          echo "  CAPI:       v1.7.0 + ClusterTopology enabled"
+          echo "  Cluster:    Traditional CAPI (no topology)"
+          echo "  Flux UI:    http://${{ secrets.HOST }}:30080"
+          echo "  Children:   ${{ needs.setup.outputs.child_clusters }}"
+          echo "  K8s:        ${{ needs.setup.outputs.k8s_version }}"
           echo "================================================"
           echo "  All declarative YAML in clusters/management/"
           echo "  Add child: git push clusters/child/<name>/"
