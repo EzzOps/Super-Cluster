@@ -13,7 +13,7 @@ spec:
         - 10.96.0.0/12
   topology:
     class: quick-start
-    version: v1.29.2
+    version: v1.36.2
     controlPlane:
       replicas: 1
     workers:
