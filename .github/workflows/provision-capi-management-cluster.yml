@@ -68,11 +68,18 @@ jobs:
         with:
           nix_path: nixpkgs=channel:nixos-unstable
 
-      # ── 0. Clusterctl (not in nixpkgs) ──
-      - name: Install clusterctl
+      # ── 0. Clusterctl + flux-operator CLI (not in nixpkgs) ──
+      - name: Install CLI tools (clusterctl + flux-operator)
         run: |
+          # clusterctl
           curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64 -o /usr/local/bin/clusterctl
           chmod +x /usr/local/bin/clusterctl
+          # flux-operator CLI
+          curl -sL https://github.com/controlplaneio-fluxcd/flux-operator/releases/download/v0.54.1/flux-operator_0.54.1_linux_amd64.tar.gz -o /tmp/flux-op.tar.gz
+          tar xzf /tmp/flux-op.tar.gz -C /usr/local/bin/ flux-operator
+          chmod +x /usr/local/bin/flux-operator
+          echo "clusterctl: $(clusterctl version 2>&1 | head -1)"
+          echo "flux-operator: $(flux-operator version 2>&1 | head -1)"
 
       # ── 1. K3s (imperative — must SSH into VPS) ──
       - name: Ensure K3s is running
@@ -117,16 +124,8 @@ jobs:
             'sudo cat /etc/rancher/k3s/k3s.yaml' > /tmp/kubeconfigs/mgmt.yaml
           sed -i "s/127.0.0.1/${{ secrets.HOST }}/g" /tmp/kubeconfigs/mgmt.yaml
 
-      # ── 4. Apply all YAML manifests from clusters/management/ ──
-      - name: Apply Flux Operator YAML
-        shell: nix-shell shell.nix --run "bash {0}"
-        run: |
-          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          kubectl apply -f clusters/management/flux-operator/install.yaml
-          kubectl wait --for=condition=Available deployment/flux-operator -n flux-system --timeout=3m
-          echo "✅ Flux Operator installed"
-
-      - name: Apply Git secret (with PAT injection)
+      # ── 4. Create Git auth secret (injected before Flux bootstrap) ──
+      - name: Create Git authentication secret
         shell: nix-shell shell.nix --run "bash {0}"
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
@@ -135,12 +134,15 @@ jobs:
           envsubst < clusters/management/flux-operator/git-secret.yaml | kubectl apply -f -
           echo "✅ Git secret injected"
 
-      - name: Apply FluxInstance YAML
+      # ── 5. Bootstrap Flux via flux-operator CLI ──
+      - name: Bootstrap Flux (operator + FluxInstance)
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          kubectl apply -f clusters/management/flux-operator/flux-instance.yaml
-          echo "✅ FluxInstance applied"
+          # The CLI installs the operator (if needed) then deploys Flux from the config
+          flux-operator install -f clusters/management/flux-operator/flux-instance.yaml
+          echo ""
+          echo "✅ Flux Operator + Flux bootstrapped"
 
       - name: Apply Web UI NodePort YAML
         shell: nix-shell shell.nix --run "bash {0}"
@@ -149,37 +151,15 @@ jobs:
           kubectl apply -f clusters/management/flux-operator/flux-web-nodeport.yaml
           echo "✅ Web UI exposed on http://${{ secrets.HOST }}:30080"
 
-      # ── 5. Wait for Flux controllers + CAPI ──
-      - name: Wait for Flux & install CAPI
+      # ── 6. Install CAPI (Flux already bootstrapped by CLI above) ──
+      - name: Install Cluster API (CAPD)
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          echo "⏳ Waiting for Flux controllers (up to 5 min)..."
-          for i in $(seq 1 30); do
-            if kubectl get deployment source-controller -n flux-system &>/dev/null; then
-              echo "  Flux controllers appearing after $((i * 10))s"
-              break
-            fi
-            if [ $((i % 10)) -eq 0 ]; then
-              echo "  - operator logs:"
-              kubectl logs -n flux-system deployment/flux-operator --tail=3 2>/dev/null || true
-              echo "  - fluxinstance status:"
-              kubectl get fluxinstance/supercluster -n flux-system -o jsonpath='{.status}' 2>/dev/null || true
-              echo ""
-            fi
-            sleep 10
-          done
-
-          # Install CAPI (idempotent)
           clusterctl init --infrastructure docker 2>&1 || true
-          echo ""
           kubectl wait --for=condition=Available deployment/capi-controller-manager -n capi-system --timeout=3m 2>/dev/null || true
           kubectl wait --for=condition=Available deployment/capd-controller-manager -n capd-system --timeout=3m 2>/dev/null || true
 
-          echo ""
-          echo "=== Management cluster state ==="
-          kubectl get pods -A | grep -E "flux|operator|capi|capd|NAME"
-      # ── 6. Summary ──
       - name: Summary
         run: |
           echo "================================================"
