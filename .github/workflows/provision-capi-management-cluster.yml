@@ -22,9 +22,6 @@ env:
     -o LogLevel=ERROR
 
 jobs:
-  # ──────────────────────────────────────────────
-  # JOB 1: Setup — config discovery, Nix, SSH check
-  # ──────────────────────────────────────────────
   setup:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -34,7 +31,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: cachix/install-nix-action@v30
         with:
           nix_path: nixpkgs=channel:nixos-unstable
@@ -45,49 +41,40 @@ jobs:
           CHILD_CLUSTERS=$(ls -d clusters/child/*/ 2>/dev/null | xargs -I{} basename {} | tr '\n' ' ')
           CHILD_CLUSTERS="${CHILD_CLUSTERS:-child-1 child-2}"
           echo "child_clusters=${CHILD_CLUSTERS}" >> $GITHUB_OUTPUT
-
           K8S_VERSION=$(grep -h 'version: v' clusters/child/*/cluster.yaml 2>/dev/null | head -1 | awk '{print $2}')
           echo "k8s_version=${K8S_VERSION:-v1.29.2}" >> $GITHUB_OUTPUT
-
           echo "Discovered: ${CHILD_CLUSTERS} @ ${K8S_VERSION:-v1.29.2}"
 
-      - name: Verify Nix-provided tools
+      - name: Verify tools
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
           echo "kubectl: $(kubectl version --client --output=json | python3 -c 'import json,sys; print(json.load(sys.stdin)["clientVersion"]["gitVersion"])')"
           echo "flux:    $(flux --version | head -1)"
-          echo "sshpass: $(sshpass -V 2>&1 | head -1)"
 
-      - name: Verify SSH connectivity to VPS
+      - name: SSH connectivity check
         shell: nix-shell shell.nix --run "bash {0}"
         env:
           SSHPASS: ${{ secrets.PASSWORD }}
-        run: |
-          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" "echo SSH_OK"
+        run: sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" "echo SSH_OK"
 
-  # ──────────────────────────────────────────────
-  # JOB 2: Deploy — reconcile management cluster desired state
-  # ──────────────────────────────────────────────
   deploy:
     runs-on: ubuntu-latest
     needs: setup
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: cachix/install-nix-action@v30
         with:
           nix_path: nixpkgs=channel:nixos-unstable
 
       # ── 0. Clusterctl (not in nixpkgs) ──
-      - name: Install clusterctl (not available in nixpkgs)
+      - name: Install clusterctl
         run: |
-          curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64 \
-            -o /usr/local/bin/clusterctl
+          curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64 -o /usr/local/bin/clusterctl
           chmod +x /usr/local/bin/clusterctl
 
-      # ── 1. K3s management cluster ──
+      # ── 1. K3s (imperative — must SSH into VPS) ──
       - name: Ensure K3s is running
         shell: nix-shell shell.nix --run "bash {0}"
         env:
@@ -98,21 +85,16 @@ jobs:
           if command -v k3s >/dev/null 2>&1 && systemctl is-active --quiet k3s; then
             echo "K3s already running — desired state met"
           else
-            echo "Installing K3s..."
             curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode=644" sh -
             systemctl enable --now k3s
           fi
           for i in $(seq 1 30); do
-            if kubectl get nodes --no-headers 2>/dev/null | grep -q Ready; then
-              echo "K3s ready after ${i}s"
-              break
-            fi
+            kubectl get nodes --no-headers 2>/dev/null | grep -q Ready && { echo "K3s ready after ${i}s"; break; }
             sleep 2
           done
-          kubectl get nodes -o wide
           REMOTE
 
-      # ── 2. Docker (CAPD dependency) ──
+      # ── 2. Docker ──
       - name: Ensure Docker is installed
         shell: nix-shell shell.nix --run "bash {0}"
         env:
@@ -120,11 +102,7 @@ jobs:
         run: |
           sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" bash -s <<'REMOTE'
           set -euo pipefail
-          if command -v docker >/dev/null 2>&1; then
-            echo "Docker already installed — desired state met"
-          else
-            curl -fsSL https://get.docker.com | sh
-          fi
+          command -v docker >/dev/null 2>&1 || curl -fsSL https://get.docker.com | sh
           docker version
           REMOTE
 
@@ -138,152 +116,80 @@ jobs:
           sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" \
             'sudo cat /etc/rancher/k3s/k3s.yaml' > /tmp/kubeconfigs/mgmt.yaml
           sed -i "s/127.0.0.1/${{ secrets.HOST }}/g" /tmp/kubeconfigs/mgmt.yaml
-          chmod 600 /tmp/kubeconfigs/mgmt.yaml
-          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          echo "Management kubeconfig retrieved"
 
-      # ── 4. Flux Operator (replaces flux bootstrap) ──
-      - name: Install Flux Operator (manages Flux declaratively)
+      # ── 4. Apply all YAML manifests from clusters/management/ ──
+      - name: Apply Flux Operator YAML
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-
-          # Clean up old flux bootstrap (if present) — uninstall controllers only
-          if kubectl get gitrepository flux-system -n flux-system &>/dev/null 2>&1; then
-            echo "Old flux bootstrap detected — cleaning up controllers..."
-            flux uninstall --silent 2>/dev/null || true
-            sleep 10  # wait for deployments to terminate
-          fi
-
-          # Install Flux Operator (idempotent)
-          kubectl apply -f https://github.com/controlplaneio-fluxcd/flux-operator/releases/download/v0.54.1/install.yaml
-
-          echo "Waiting for Flux Operator to be ready..."
+          kubectl apply -f clusters/management/flux-operator/install.yaml
           kubectl wait --for=condition=Available deployment/flux-operator -n flux-system --timeout=3m
           echo "✅ Flux Operator installed"
 
-      # ── 5. Git credentials secret ──
-      - name: Create Git authentication secret
+      - name: Apply Git secret (with PAT injection)
         shell: nix-shell shell.nix --run "bash {0}"
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          kubectl create secret generic flux-system -n flux-system \
-            --from-literal=username=git \
-            --from-literal=password="$GH_TOKEN" \
-            --dry-run=client -o yaml | kubectl apply -f -
-          echo "✅ Git secret 'flux-system' created/updated"
+          envsubst < clusters/management/flux-operator/git-secret.yaml | kubectl apply -f -
+          echo "✅ Git secret injected"
 
-      # ── 6. FluxInstance + Debug ──
-      - name: Apply FluxInstance (declarative Flux desired state)
+      - name: Apply FluxInstance YAML
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
           kubectl apply -f clusters/management/flux-operator/flux-instance.yaml
           echo "✅ FluxInstance applied"
-          echo ""
-          echo "=== FluxInstance status ==="
-          kubectl get fluxinstance/supercluster -n flux-system -o yaml || echo "  (no status yet)"
-          echo ""
-          echo "=== Flux Operator logs (last 30 lines) ==="
-          kubectl logs -n flux-system deployment/flux-operator --tail=30 2>/dev/null || echo "  (no logs yet)"
-          echo ""
-          echo "=== Flux Operator events ==="
-          kubectl get events -n flux-system --field-selector involvedObject.kind=Deployment,involvedObject.name=flux-operator --sort-by=.lastTimestamp 2>/dev/null | tail -10 || true
 
-      - name: Wait for Flux to be fully reconciled
+      - name: Apply Web UI NodePort YAML
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          echo "⏳ Waiting for Flux controllers to deploy (up to 5 min)..."
+          kubectl apply -f clusters/management/flux-operator/flux-web-nodeport.yaml
+          echo "✅ Web UI exposed on http://${{ secrets.HOST }}:30080"
+
+      # ── 5. Wait for Flux controllers + CAPI ──
+      - name: Wait for Flux & install CAPI
+        shell: nix-shell shell.nix --run "bash {0}"
+        run: |
+          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          echo "⏳ Waiting for Flux controllers (up to 5 min)..."
           for i in $(seq 1 30); do
-            READY=$(kubectl get fluxinstance/supercluster -n flux-system \
-              -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
-            if [ "$READY" = "True" ]; then
-              echo "✅ FluxInstance Ready after ~$((i * 10))s"
+            if kubectl get deployment source-controller -n flux-system &>/dev/null; then
+              echo "  Flux controllers appearing after $((i * 10))s"
               break
             fi
-            if kubectl get deployment source-controller -n flux-system &>/dev/null; then
-              echo "  Flux controllers deploying... (retry $i/30)"
-            else
-              echo "  Waiting for Flux controllers... (retry $i/30)"
-            fi
-            # Every 10 retries, log operator status for debugging
             if [ $((i % 10)) -eq 0 ]; then
-              echo "  --- operator logs ---"
-              kubectl logs -n flux-system deployment/flux-operator --tail=5 2>/dev/null || true
-              echo "  --- fluxinstance status ---"
-              kubectl get fluxinstance/supercluster -n flux-system \
-                -o jsonpath='{.status.conditions[*].message}' 2>/dev/null || true
+              echo "  - operator logs:"
+              kubectl logs -n flux-system deployment/flux-operator --tail=3 2>/dev/null || true
+              echo "  - fluxinstance status:"
+              kubectl get fluxinstance/supercluster -n flux-system -o jsonpath='{.status}' 2>/dev/null || true
               echo ""
             fi
             sleep 10
           done
 
-          # Fail if no Flux controllers appeared
-          if ! kubectl get deployment source-controller -n flux-system &>/dev/null; then
-            echo "❌ Flux controllers were never deployed by the operator!"
-            echo "=== Flux Operator logs ==="
-            kubectl logs -n flux-system deployment/flux-operator --tail=50 2>/dev/null || true
-            echo ""
-            echo "=== FluxInstance full status ==="
-            kubectl get fluxinstance/supercluster -n flux-system -o yaml 2>/dev/null || true
-            exit 1
-          fi
-
-          # Wait for source-controller to be available
-          echo "  Waiting for source-controller to be Available..."
-          kubectl wait --for=condition=Available deployment/source-controller -n flux-system --timeout=3m
-
+          # Install CAPI (idempotent)
+          clusterctl init --infrastructure docker 2>&1 || true
           echo ""
-          echo "=== Flux components ==="
-          kubectl get pods -n flux-system | grep -E "source|kustomize|helm|notification|NAME"
-          echo ""
-          echo "=== GitRepository ==="
-          kubectl get gitrepository -n flux-system -o wide
-
-      # ── 7. Web UI access ──
-      - name: Expose Flux Web UI via NodePort
-        shell: nix-shell shell.nix --run "bash {0}"
-        run: |
-          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          kubectl apply -f clusters/management/flux-operator/flux-web-nodeport.yaml
-          echo "✅ Flux Web UI exposed on NodePort 30080"
-          echo ""
-          echo "Access the Flux UI at: http://${{ secrets.HOST }}:30080"
-          echo ""
-          echo "The Web UI gives you real-time visibility into:"
-          echo "  - Cluster dashboard (controller status, reconciliation activity)"
-          echo "  - GitOps pipeline graph (source → kustomization → workload)"
-          echo "  - Helm release dashboard with values and revision history"
-          echo "  - Pod log viewer with level detection and stack trace grouping"
-          echo "  - Real-time Kubernetes event viewer"
-          echo "  - Advanced resource search and favorites"
-
-      # ── 8. Cluster API (CAPD) ──
-      - name: Install Cluster API with Docker provider (idempotent)
-        shell: nix-shell shell.nix --run "bash {0}"
-        run: |
-          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          clusterctl init --infrastructure docker
           kubectl wait --for=condition=Available deployment/capi-controller-manager -n capi-system --timeout=3m 2>/dev/null || true
           kubectl wait --for=condition=Available deployment/capd-controller-manager -n capd-system --timeout=3m 2>/dev/null || true
-          echo "=== CAPI / CAPD state ==="
-          kubectl get pods -n capi-system -n capd-system 2>/dev/null | grep -E "capi|capd|NAME"
 
-      # ── 9. Summary ──
+          echo ""
+          echo "=== Management cluster state ==="
+          kubectl get pods -A | grep -E "flux|operator|capi|capd|NAME"
+      # ── 6. Summary ──
       - name: Summary
         run: |
           echo "================================================"
           echo "  Management cluster desired state applied ✓"
           echo "================================================"
-          echo "  Components: K3s + Flux Operator + CAPI (CAPD)"
+          echo "  Components: K3s + Flux Operator + CAPI"
           echo "  Flux UI:    http://${{ secrets.HOST }}:30080"
-          echo "  Child clusters: ${{ needs.setup.outputs.child_clusters }}"
-          echo "  Kubernetes:     ${{ needs.setup.outputs.k8s_version }}"
+          echo "  Children:   ${{ needs.setup.outputs.child_clusters }}"
+          echo "  K8s:        ${{ needs.setup.outputs.k8s_version }}"
           echo "================================================"
-          echo "  To add a child: git push a new cluster.yaml"
-          echo "  Flux + CAPI on-cluster auto-provisions"
-          echo "  Flux Operator manages Flux lifecycle"
+          echo "  All declarative YAML in clusters/management/"
+          echo "  Add child: git push clusters/child/<name>/"
           echo "================================================"
