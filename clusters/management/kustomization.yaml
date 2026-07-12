@@ -4,4 +4,3 @@ resources:
   - child-1-apps.yaml
   - child-2-apps.yaml
   - remote-child-kustomization.yaml
-  - clusterclass.yaml
