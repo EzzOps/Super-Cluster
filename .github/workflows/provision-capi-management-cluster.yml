@@ -22,26 +22,40 @@ env:
     -o LogLevel=ERROR
 
 jobs:
-  ensure-super-cluster:
+  # ──────────────────────────────────────────────
+  # JOB 1: Setup — discover config, install tools, verify connectivity
+  # ──────────────────────────────────────────────
+  setup:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 5
+    outputs:
+      child_clusters: ${{ steps.config.outputs.child_clusters }}
+      k8s_version: ${{ steps.config.outputs.k8s_version }}
+      matrix: ${{ steps.config.outputs.matrix }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Read cluster configuration from repo
         id: config
         run: |
           # Dynamically discover child clusters from repo
           CHILD_CLUSTERS=$(ls -d clusters/child/*/ 2>/dev/null | xargs -I{} basename {} | tr '\n' ' ')
-          echo "child_clusters=${CHILD_CLUSTERS:-child-1 child-2}" >> $GITHUB_OUTPUT
-          
+          CHILD_CLUSTERS="${CHILD_CLUSTERS:-child-1 child-2}"
+          echo "child_clusters=${CHILD_CLUSTERS}" >> $GITHUB_OUTPUT
+
           # Read K8s version from child cluster manifests
           K8S_VERSION=$(grep -h 'version: v' clusters/child/*/cluster.yaml 2>/dev/null | head -1 | awk '{print $2}')
           echo "k8s_version=${K8S_VERSION:-v1.29.2}" >> $GITHUB_OUTPUT
-          
-          echo "Discovered child clusters: ${CHILD_CLUSTERS:-child-1 child-2}"
+
+          # Build JSON matrix for parallel child cluster validation
+          MATRIX_JSON='{"cluster": []}'
+          if command -v jq &>/dev/null; then
+            MATRIX_JSON=$(echo "$CHILD_CLUSTERS" | tr ' ' '\n' | jq -R -s -c '{cluster: [.] | map(select(length > 0))}')
+          fi
+          echo "matrix=${MATRIX_JSON}" >> $GITHUB_OUTPUT
+
+          echo "Discovered child clusters: ${CHILD_CLUSTERS}"
           echo "K8s version: ${K8S_VERSION:-v1.29.2}"
 
       - name: Install tools (sshpass, kubectl, Flux CLI, clusterctl)
@@ -58,6 +72,25 @@ jobs:
           SSHPASS: ${{ secrets.PASSWORD }}
         run: |
           sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" "echo SSH_OK && uname -a && free -h"
+
+  # ──────────────────────────────────────────────
+  # JOB 2: Deploy — ensure K3s, Docker, Flux, CAPI on VPS
+  # ──────────────────────────────────────────────
+  deploy:
+    runs-on: ubuntu-latest
+    needs: setup
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools (kubectl, Flux CLI, clusterctl)
+        run: |
+          curl -fsSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.29.2/bin/linux/amd64/kubectl
+          chmod +x /usr/local/bin/kubectl
+          curl -s https://fluxcd.io/install.sh | sudo bash
+          curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64 -o /usr/local/bin/clusterctl
+          chmod +x /usr/local/bin/clusterctl
 
       - name: Ensure K3s management cluster is running
         env:
@@ -110,88 +143,121 @@ jobs:
 
       - name: Bootstrap Flux on management cluster
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          BRANCH="${GITHUB_REF_NAME:-main}"
-          # Idempotent: flux bootstrap skips if already bootstrapped
-          kubectl create namespace flux-system --dry-run=client -o yaml | kubectl apply -f -
           flux bootstrap git \
             --url=https://github.com/${GITHUB_REPOSITORY}.git \
-            --branch="${BRANCH}" \
+            --branch="${GITHUB_REF_NAME:-main}" \
             --path=./clusters/management \
             --token-auth \
-            --password="$GITHUB_TOKEN" \
             --silent
 
       - name: Install Cluster API with Docker provider (CAPD)
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          # Idempotent: clusterctl init skips if already installed
           echo "Initializing CAPI with Docker provider..."
           clusterctl init --infrastructure docker
-          kubectl wait --for=condition=Available deployment/capi-controller-manager -n capi-system --timeout=5m 2>/dev/null || true
-          kubectl wait --for=condition=Available deployment/capd-controller-manager -n capd-system --timeout=5m 2>/dev/null || true
+          kubectl wait --for=condition=Available deployment/capi-controller-manager -n capi-system --timeout=3m 2>/dev/null || true
+          kubectl wait --for=condition=Available deployment/capd-controller-manager -n capd-system --timeout=3m 2>/dev/null || true
           echo "=== CAPI / CAPD pods ==="
           kubectl get pods -A | grep -E "capi|capd|NAME"
 
       - name: Trigger Flux to reconcile latest manifest changes
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          # Force immediate reconcile (GitRepository already polls every 1m)
           kubectl annotate --overwrite gitrepository/flux-system -n flux-system \
             flux.fluxcd.io/reconcileAt="$(date +%s)"
-          echo "Flux reconcile triggered."
-          echo "CAPI will create/update child clusters declaratively from repo manifests."
-          echo ""
+          echo "Flux reconcile triggered — CAPI will create/update child clusters declaratively"
 
-      - name: Wait for child clusters (CAPD) to provision and retrieve kubeconfigs
+      - name: Upload management kubeconfig for downstream jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: mgmt-kubeconfig
+          path: /tmp/kubeconfigs/mgmt.yaml
+          retention-days: 1
+          if-no-files-found: error
+
+  # ──────────────────────────────────────────────
+  # JOB 3: Validate — wait for each child cluster (parallel matrix)
+  # ──────────────────────────────────────────────
+  validate:
+    runs-on: ubuntu-latest
+    needs: [setup, deploy]
+    timeout-minutes: 10
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+
+    steps:
+      - name: Download management kubeconfig
+        uses: actions/download-artifact@v4
+        with:
+          name: mgmt-kubeconfig
+          path: /tmp/kubeconfigs/
+
+      - name: Install tools (kubectl, clusterctl)
+        run: |
+          curl -fsSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.29.2/bin/linux/amd64/kubectl
+          chmod +x /usr/local/bin/kubectl
+          curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64 -o /usr/local/bin/clusterctl
+          chmod +x /usr/local/bin/clusterctl
+
+      - name: Wait for ${{ matrix.cluster }} to provision and retrieve kubeconfig
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          CHILD_CLUSTERS="${{ steps.config.outputs.child_clusters }}"
-          echo "Waiting for child clusters to become Provisioned (up to 5 min)..."
-          for child in $CHILD_CLUSTERS; do
-            echo "--- Checking $child ---"
-            for i in $(seq 1 30); do
-              # Get phase, handle case where cluster resource doesn't exist yet
-              phase=$(kubectl get cluster "$child" -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-              if [ "$phase" = "Provisioned" ]; then
-                echo "$child is Provisioned after ~$((i * 10))s"
-                # Retrieve and store kubeconfig
-                clusterctl get kubeconfig "$child" -n default > "/tmp/kubeconfigs/$child.yaml" 2>/dev/null || true
-                if [ -s "/tmp/kubeconfigs/$child.yaml" ]; then
-                  echo "  ✅ Retrieved kubeconfig for $child"
-                  kubectl create secret generic "kubeconfig-$child" -n flux-system \
-                    --from-file=value=/tmp/kubeconfigs/$child.yaml \
-                    --dry-run=client -o yaml | kubectl apply -f -
-                  echo "  ✅ Imported kubeconfig-$child into Flux"
-                fi
-                break
-              fi
-              echo "  $child phase: ${phase:-N/A} (not ready yet, retrying in 10s)..."
-              sleep 10
-            done
+          echo "⏳ Waiting for ${{ matrix.cluster }} to become Provisioned (up to 5 min)..."
+          PROVISIONED=false
+          for i in $(seq 1 30); do
+            phase=$(kubectl get cluster "${{ matrix.cluster }}" -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+            if [ "$phase" = "Provisioned" ]; then
+              echo "✅ ${{ matrix.cluster }} is Provisioned after ~$((i * 10))s"
+              PROVISIONED=true
+              break
+            fi
+            echo "  ${{ matrix.cluster }} phase: ${phase:-N/A} (retry $i/30 in 10s)..."
+            sleep 10
           done
-          echo ""
-          echo "=== Final CAPI state ==="
-          kubectl get clusters -A -o wide 2>/dev/null || echo "No clusters"
-          kubectl get machines -A -o wide 2>/dev/null || echo "No machines"
 
-      - name: Summary
+          if [ "$PROVISIONED" = "true" ]; then
+            clusterctl get kubeconfig "${{ matrix.cluster }}" -n default > "/tmp/kubeconfigs/${{ matrix.cluster }}.yaml" 2>/dev/null || true
+            if [ -s "/tmp/kubeconfigs/${{ matrix.cluster }}.yaml" ]; then
+              echo "  ✅ Retrieved kubeconfig for ${{ matrix.cluster }}"
+              kubectl create secret generic "kubeconfig-${{ matrix.cluster }}" -n flux-system \
+                --from-file=value="/tmp/kubeconfigs/${{ matrix.cluster }}.yaml" \
+                --dry-run=client -o yaml | kubectl apply -f -
+              echo "  ✅ Imported kubeconfig-${{ matrix.cluster }} into Flux"
+            else
+              echo "  ⚠️ kubeconfig file empty or retrieval failed"
+            fi
+          else
+            echo "❌ ${{ matrix.cluster }} did not reach Provisioned within timeout"
+          fi
+
+  # ──────────────────────────────────────────────
+  # JOB 4: Report — summary of everything deployed
+  # ──────────────────────────────────────────────
+  report:
+    runs-on: ubuntu-latest
+    needs: [setup, deploy, validate]
+    if: always()
+    timeout-minutes: 2
+
+    steps:
+      - name: Deployment summary
         run: |
-          echo "========================================"
-          echo "  Super-Cluster GitOps pipeline done"
-          echo "========================================"
-          echo "  ! Fully idempotent - safe to re-run"
+          echo "================================================"
+          echo "  Super-Cluster GitOps pipeline complete"
+          echo "================================================"
+          echo "  ! Fully idempotent — safe to re-run"
           echo "  ! Changes via YAML edits only"
-          echo "  ! Flux + CAPI reconcile loop active"
-          echo "========================================"
-          echo "  Management: K3s (CAPI via clusterctl)"
-          echo "  Child clusters (${{ steps.config.outputs.child_clusters }})"
-          echo "  Kubernetes: ${{ steps.config.outputs.k8s_version }}"
-          echo "========================================"
+          echo "  ! Flux + CAPI reconcile loop active (every 1m)"
+          echo "================================================"
+          echo "  Management:    K3s (CAPI via clusterctl)"
+          echo "  Child clusters: ${{ needs.setup.outputs.child_clusters }}"
+          echo "  Kubernetes:    ${{ needs.setup.outputs.k8s_version }}"
+          echo "================================================"
           echo "  To add a new child cluster:"
           echo "    1. Create clusters/child/<name>/cluster.yaml"
           echo "    2. Push to main"
           echo "    3. Flux + CAPI auto-provisions"
-          echo "========================================"
+          echo "================================================"
