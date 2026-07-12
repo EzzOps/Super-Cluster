@@ -139,6 +139,8 @@ jobs:
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          # Remove old operator deployment if present (CLI can't upgrade it due to immutable selector)
+          kubectl delete deployment flux-operator -n flux-system --ignore-not-found 2>/dev/null || true
           # The CLI installs the operator (if needed) then deploys Flux from the config
           flux-operator install -f clusters/management/flux-operator/flux-instance.yaml
           echo ""
