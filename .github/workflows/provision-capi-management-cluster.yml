@@ -234,19 +234,19 @@ jobs:
             for i in $(seq 1 36); do
               phase=$(kubectl get cluster "$child" -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
               if [ "$phase" = "Provisioned" ]; then
-                echo "  \\u2705 $child is Provisioned after ~$((i * 10))s"
+                echo -e "  \\xE2\\x9C\\x85 $child is Provisioned after ~$((i * 10))s"
                 break
               fi
-              echo "  \u23f3 $child phase: ${phase:-N/A} (retry $i/36)..."
+              echo -e "  \\xE2\\x8F\\xB3 $child phase: ${phase:-N/A} (retry $i/36)..."
               sleep 10
             done
             clusterctl get kubeconfig "$child" -n default > "/tmp/kubeconfigs/$child.yaml" 2>/dev/null || true
             if [ -s "/tmp/kubeconfigs/$child.yaml" ]; then
-              echo "  \u0001F511 Retrieved kubeconfig for $child"
+              echo -e "  \\xF0\\x9F\\x94\\x91 Retrieved kubeconfig for $child"
               kubectl create secret generic "kubeconfig-$child" -n flux-system                 --from-file=value=/tmp/kubeconfigs/$child.yaml                 --dry-run=client -o yaml | kubectl apply -f -
-              echo "  \u2705 Secret kubeconfig-$child created in flux-system"
+              echo -e "  \\xE2\\x9C\\x85 Secret kubeconfig-$child created in flux-system"
             else
-              echo "  \u26a0\ufe0f Could not retrieve kubeconfig for $child (not yet Provisioned)"
+              echo -e "  \\xE2\\x9A\\xA0\\xEF\\xB8\\x8F Could not retrieve kubeconfig for $child (not yet Provisioned)"
               echo "  Flux child-1-apps/child-2-apps will keep failing until ready."
               echo "  Re-run this workflow after the cluster provisions."
             fi
