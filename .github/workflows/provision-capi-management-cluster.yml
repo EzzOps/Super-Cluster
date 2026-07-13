@@ -154,7 +154,16 @@ jobs:
 
           echo ""
           echo "=== Verifying ClusterTopology feature gate ==="
-          kubectl get deploy capi-controller-manager -n capi-system -o jsonpath='{.spec.template.spec.containers[0].env}' 2>/dev/null | python3 -c "
+          CAPTURE=$(kubectl get deploy capi-controller-manager -n capi-system -o jsonpath='{.spec.template.spec.containers[0].env}' 2>/dev/null)
+          if [ -n "$CAPTURE" ]; then
+            if echo "$CAPTURE" | grep -q "CLUSTER_TOPOLOGY"; then
+              echo "  CLUSTER_TOPOLOGY=true"
+            else
+              echo "  CLUSTER_TOPOLOGY not set in env"
+            fi
+          else
+            echo "  (could not verify)"
+          fi
           import json,sys
           envs = json.load(sys.stdin)
           for e in envs:
