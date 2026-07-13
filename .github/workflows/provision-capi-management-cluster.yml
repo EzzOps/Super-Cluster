@@ -1,3 +1,4 @@
+---CONTENT---
 name: Manage Management Cluster (desired state)
 
 on:
@@ -154,13 +155,13 @@ jobs:
           echo ""
           echo "=== Verifying ClusterTopology feature gate ==="
           kubectl get deploy capi-controller-manager -n capi-system -o jsonpath='{.spec.template.spec.containers[0].env}' 2>/dev/null | python3 -c "
-import json,sys
-envs = json.load(sys.stdin)
-for e in envs:
-    if 'TOPOLOGY' in e.get('name','').upper() or 'CLUSTER' in e.get('name','').upper():
-        print(f'  {e["name"]}={e.get("value","")}')
-if not any('TOPOLOGY' in e.get('name','').upper() for e in envs):
-    print('  ⚠️  CLUSTER_TOPOLOGY not found in env — checking args...')
+          import json,sys
+          envs = json.load(sys.stdin)
+          for e in envs:
+          if 'TOPOLOGY' in e.get('name','').upper() or 'CLUSTER' in e.get('name','').upper():
+          print(f'  {e["name"]}={e.get("value","")}')
+          if not any('TOPOLOGY' in e.get('name','').upper() for e in envs):
+    print('  CLUSTER_TOPOLOGY not found in env — checking args...')
 " 2>/dev/null || echo "  (could not verify)"
 
       # ── 6. Create Git auth secret ──
@@ -234,3 +235,4 @@ if not any('TOPOLOGY' in e.get('name','').upper() for e in envs):
           echo "  All declarative YAML in clusters/management/"
           echo "  Add child: git push clusters/child/<name>/"
           echo "================================================"
+
