@@ -164,14 +164,6 @@ jobs:
           else
             echo "  (could not verify)"
           fi
-          import json,sys
-          envs = json.load(sys.stdin)
-          for e in envs:
-          if 'TOPOLOGY' in e.get('name','').upper() or 'CLUSTER' in e.get('name','').upper():
-          print(f'  {e["name"]}={e.get("value","")}')
-          if not any('TOPOLOGY' in e.get('name','').upper() for e in envs):
-    print('  CLUSTER_TOPOLOGY not found in env — checking args...')
-" 2>/dev/null || echo "  (could not verify)"
 
       # ── 6. Create Git auth secret ──
       - name: Create Git authentication secret
