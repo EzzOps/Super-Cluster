@@ -1,0 +1,32 @@
+apiVersion: config.projectsveltos.io/v1beta1
+kind: ClusterProfile
+metadata:
+  name: monitoring-prod
+spec:
+  clusterSelector:
+    matchLabels:
+      env: prod
+  syncMode: ContinuousWithDriftDetection
+  helmCharts:
+  - repositoryURL: https://prometheus-community.github.io/helm-charts
+    repositoryName: prometheus-community
+    chartName: prometheus-community/kube-prometheus-stack
+    chartVersion: "60.0.0"
+    releaseName: monitoring
+    releaseNamespace: monitoring
+    helmChartAction: Install
+    values: |
+      grafana:
+        enabled: true
+        ingress:
+          enabled: false
+      prometheus:
+        prometheusSpec:
+          retention: 7d
+  - repositoryURL: https://grafana.github.io/helm-charts
+    repositoryName: grafana
+    chartName: grafana/loki-stack
+    chartVersion: "2.9.0"
+    releaseName: logging
+    releaseNamespace: monitoring
+    helmChartAction: Install
