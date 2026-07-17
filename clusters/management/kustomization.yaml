@@ -2,7 +2,6 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - child-1-apps.yaml
-  - child-2-apps.yaml
   - remote-child-kustomization.yaml
   - sveltos/
-# last-updated: 2026-07-17T13:30:00 (added Sveltos integration)
+# last-updated: 2026-07-17T13:45:00 (removed child-2 for resource constraints)
