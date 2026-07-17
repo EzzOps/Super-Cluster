@@ -60,7 +60,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     needs: setup
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v4
@@ -207,18 +207,35 @@ jobs:
           kubectl apply -f clusters/management/flux-operator/flux-web-nodeport.yaml
           echo "✅ Web UI exposed on http://${{ secrets.HOST }}:30080"
 
-      # ── 8. Trigger Flux reconcile ──
+      # ── 8. Install Sveltos add-on controller ──
+      - name: Install Sveltos add-on controller
+        run: |
+          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
+          echo "Installing Sveltos addon-controller v1.12.0..."
+          kubectl apply -f https://raw.githubusercontent.com/projectsveltos/addon-controller/v1.12.0/manifest/manifest.yaml
+          echo "⏳ Waiting for Sveltos to be ready..."
+          kubectl wait --for=condition=Available deployment/addon-controller -n projectsveltos --timeout=3m
+          echo "=== Sveltos components ==="
+          kubectl get pods -n projectsveltos
+          echo "✅ Sveltos addon-controller v1.12.0 installed"
+
+      # ── 9. Trigger Flux reconcile ──
       - name: Force Flux reconcile
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
           kubectl annotate --overwrite gitrepository/flux-system -n flux-system             flux.fluxcd.io/reconcileAt="$(date +%s)"
           echo "Flux reconcile triggered — CAPI will provision child clusters"
+          # Sveltos auto-discovers CAPI clusters via labels
+          echo "Sveltos ClusterProfiles will auto-deploy add-ons to matching clusters"
           sleep 15
           echo "=== CAPI Cluster state ==="
           kubectl get clusters -A -o wide 2>/dev/null || echo "No clusters yet"
           kubectl get kubeadmcontrolplane -A 2>/dev/null || echo "No control planes yet"
           kubectl get machinedeployment -A 2>/dev/null || echo "No machine deployments yet"
+          echo "=== Sveltos ClusterProfile state ==="
+          kubectl get clusterprofile 2>/dev/null || echo "No ClusterProfiles yet (Flux still syncing)"
+          kubectl get clustersummary -A 2>/dev/null || echo "No ClusterSummaries yet"
 
       - name: Wait for child clusters to provision and inject kubeconfigs into Flux
         shell: nix-shell shell.nix --run "bash {0}"
@@ -234,19 +251,19 @@ jobs:
             for i in $(seq 1 36); do
               phase=$(kubectl get cluster "$child" -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
               if [ "$phase" = "Provisioned" ]; then
-                echo -e "  \\xE2\\x9C\\x85 $child is Provisioned after ~$((i * 10))s"
+                echo -e "  \xE2\x9C\x85 $child is Provisioned after ~$((i * 10))s"
                 break
               fi
-              echo -e "  \\xE2\\x8F\\xB3 $child phase: ${phase:-N/A} (retry $i/36)..."
+              echo -e "  \xE2\x8F\xB3 $child phase: ${phase:-N/A} (retry $i/36)..."
               sleep 10
             done
             clusterctl get kubeconfig "$child" -n default > "/tmp/kubeconfigs/$child.yaml" 2>/dev/null || true
             if [ -s "/tmp/kubeconfigs/$child.yaml" ]; then
-              echo -e "  \\xF0\\x9F\\x94\\x91 Retrieved kubeconfig for $child"
+              echo -e "  \xF0\x9F\x94\x91 Retrieved kubeconfig for $child"
               kubectl create secret generic "kubeconfig-$child" -n flux-system                 --from-file=value=/tmp/kubeconfigs/$child.yaml                 --dry-run=client -o yaml | kubectl apply -f -
-              echo -e "  \\xE2\\x9C\\x85 Secret kubeconfig-$child created in flux-system"
+              echo -e "  \xE2\x9C\x85 Secret kubeconfig-$child created in flux-system"
             else
-              echo -e "  \\xE2\\x9A\\xA0\\xEF\\xB8\\x8F Could not retrieve kubeconfig for $child (not yet Provisioned)"
+              echo -e "  \xE2\x9A\xA0\xEF\xB8\x8F Could not retrieve kubeconfig for $child (not yet Provisioned)"
               echo "  Flux child-1-apps/child-2-apps will keep failing until ready."
               echo "  Re-run this workflow after the cluster provisions."
             fi
@@ -255,20 +272,30 @@ jobs:
           echo "=== Final CAPI state ==="
           kubectl get clusters -A -o wide 2>/dev/null || echo "No clusters"
           kubectl get machines -A -o wide 2>/dev/null || echo "No machines"
+          echo ""
+          echo "=== Sveltos ClusterSummary status ==="
+          kubectl get clustersummary -A 2>/dev/null || echo "No ClusterSummaries yet"
 
       - name: Summary
         run: |
           echo "================================================"
           echo "  Management cluster desired state applied ✓"
           echo "================================================"
-          echo "  Components: K3s + Flux Operator + CAPI"
+          echo "  Components: K3s + Flux Operator + CAPI + Sveltos"
+          echo "  Flux:       GitOps (syncs clusters/management/)"
           echo "  CAPI:       v1.7.0 + ClusterTopology enabled"
+          echo "  Sveltos:    v1.12.0 (fleet add-on controller)"
           echo "  Cluster:    Traditional CAPI (no topology)"
           echo "  Flux UI:    http://${{ secrets.HOST }}:30080"
           echo "  Children:   ${{ needs.setup.outputs.child_clusters }}"
           echo "  K8s:        ${{ needs.setup.outputs.k8s_version }}"
           echo "================================================"
-          echo "  All declarative YAML in clusters/management/"
-          echo "  Add child: git push clusters/child/<name>/"
+          echo "  Child cluster add-on management via Sveltos:"
+          echo "    baseline-addons      → all clusters (metrics-server, cert-manager)"
+          echo "    capi-bootstrap-cni   → all clusters, OneTime (Cilium CNI)"
+          echo "    monitoring-prod      → env=prod clusters (kube-prometheus-stack + Loki)"
           echo "================================================"
-
+          echo "  To label a child cluster for specific add-ons:"
+          echo "    kubectl label cluster <name> -n default env=prod"
+          echo "  Sveltos deploys matching add-ons automatically."
+          echo "================================================"
