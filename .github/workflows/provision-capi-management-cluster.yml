@@ -1,5 +1,7 @@
 name: Manage Management Cluster (desired state)
-
+concurrency:
+  group: provision-capi-management-cluster
+  cancel-in-progress: true
 on:
   push:
     branches: [main]
