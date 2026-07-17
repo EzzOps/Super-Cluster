@@ -4,4 +4,5 @@ resources:
   - child-1-apps.yaml
   - child-2-apps.yaml
   - remote-child-kustomization.yaml
-# last-updated: 2026-07-12T18:18:27.036710
+  - sveltos/
+# last-updated: 2026-07-17T13:30:00 (added Sveltos integration)
