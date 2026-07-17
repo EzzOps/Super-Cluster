@@ -1,0 +1,23 @@
+apiVersion: config.projectsveltos.io/v1beta1
+kind: ClusterProfile
+metadata:
+  name: capi-bootstrap-cni
+spec:
+  clusterSelector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: "*"
+  syncMode: OneTime
+  helmCharts:
+  - repositoryURL: https://helm.cilium.io
+    repositoryName: cilium
+    chartName: cilium/cilium
+    chartVersion: "1.16.0"
+    releaseName: cilium
+    releaseNamespace: kube-system
+    helmChartAction: Install
+    values: |
+      kubeProxyReplacement: "disabled"
+      cni:
+        chainingMode: portmap
+      ipam:
+        mode: kubernetes
