@@ -5,19 +5,15 @@ metadata:
 spec:
   clusterSelector:
     matchLabels:
-      cluster.x-k8s.io/cluster-name: "*"
-  syncMode: OneTime
+      env: prod
   helmCharts:
-  - repositoryURL: https://helm.cilium.io
-    repositoryName: cilium
-    chartName: cilium/cilium
-    chartVersion: "1.16.0"
+  - chartName: cilium/cilium
+    chartVersion: 1.16.0
+    helmChartAction: Install
     releaseName: cilium
     releaseNamespace: kube-system
-    helmChartAction: Install
-    values: |
-      kubeProxyReplacement: "disabled"
-      cni:
-        chainingMode: portmap
-      ipam:
-        mode: kubernetes
+    repositoryName: cilium
+    repositoryURL: https://helm.cilium.io
+    values: "kubeProxyReplacement: \"disabled\"\ncni:\n  chainingMode: portmap\nipam:\n\
+      \  mode: kubernetes\n"
+  syncMode: OneTime

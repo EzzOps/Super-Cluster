@@ -5,20 +5,20 @@ metadata:
 spec:
   clusterSelector:
     matchLabels:
-      cluster.x-k8s.io/cluster-name: "*"
-  syncMode: ContinuousWithDriftDetection
+      env: prod
   helmCharts:
-  - repositoryURL: https://kubernetes-sigs.github.io/metrics-server/
-    repositoryName: metrics-server
-    chartName: metrics-server/metrics-server
+  - chartName: metrics-server/metrics-server
     chartVersion: v0.7.1
+    helmChartAction: Install
     releaseName: metrics-server
     releaseNamespace: kube-system
-    helmChartAction: Install
-  - repositoryURL: https://charts.cert-manager.io
-    repositoryName: cert-manager
-    chartName: cert-manager/cert-manager
+    repositoryName: metrics-server
+    repositoryURL: https://kubernetes-sigs.github.io/metrics-server/
+  - chartName: cert-manager/cert-manager
     chartVersion: v1.15.0
+    helmChartAction: Install
     releaseName: cert-manager
     releaseNamespace: cert-manager
-    helmChartAction: Install
+    repositoryName: cert-manager
+    repositoryURL: https://charts.cert-manager.io
+  syncMode: ContinuousWithDriftDetection
