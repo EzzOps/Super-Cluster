@@ -210,16 +210,20 @@ jobs:
           echo "✅ Web UI exposed on http://${{ secrets.HOST }}:30080"
 
       # ── 8. Install Sveltos add-on controller ──
-      - name: Install Sveltos add-on controller
+      - name: Install Sveltos lib CRDs + add-on controller
         run: |
           export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          echo "Installing Sveltos addon-controller v1.12.0..."
-          kubectl apply -f https://raw.githubusercontent.com/projectsveltos/addon-controller/v1.12.0/manifest/manifest.yaml
+          echo "Installing Sveltos libsveltos CRDs (SveltosCluster, ClusterSet, Set)..."
+          kubectl apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/main/config/crd/bases/lib.projectsveltos.io_sveltosclusters.yaml
+          kubectl apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/main/config/crd/bases/lib.projectsveltos.io_clustersets.yaml
+          kubectl apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/main/config/crd/bases/lib.projectsveltos.io_sets.yaml
+          echo "Installing Sveltos addon-controller v1.13.0..."
+          kubectl apply -f https://raw.githubusercontent.com/projectsveltos/addon-controller/v1.13.0/manifest/manifest.yaml
           echo "⏳ Waiting for Sveltos to be ready..."
           kubectl wait --for=condition=Available deployment/addon-controller -n projectsveltos --timeout=3m
           echo "=== Sveltos components ==="
           kubectl get pods -n projectsveltos
-          echo "✅ Sveltos addon-controller v1.12.0 installed"
+          echo "✅ Sveltos addon-controller v1.13.0 installed"
 
       # ── 9. Trigger Flux reconcile ──
       - name: Force Flux reconcile
