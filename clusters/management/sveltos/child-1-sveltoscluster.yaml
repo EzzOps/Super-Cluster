@@ -1,0 +1,9 @@
+apiVersion: lib.projectsveltos.io/v1beta1
+kind: SveltosCluster
+metadata:
+  name: child-1
+  namespace: default
+  labels:
+    env: prod
+spec:
+  kubeconfigName: child-1-kubeconfig
