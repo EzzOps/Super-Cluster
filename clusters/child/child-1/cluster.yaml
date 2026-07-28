@@ -29,6 +29,10 @@ kind: DockerCluster
 metadata:
   name: child-1
   namespace: default
+spec:
+  controlPlaneEndpoint:
+    host: 172.19.0.3
+    port: 6443
 ---
 apiVersion: controlplane.cluster.x-k8s.io/v1beta1
 kind: KubeadmControlPlane
@@ -117,4 +121,4 @@ spec:
       joinConfiguration:
         discovery:
           bootstrapToken:
-            apiServerEndpoint: 161.97.103.249:32769
+            apiServerEndpoint: 172.19.0.3:6443
