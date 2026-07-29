@@ -16,11 +16,11 @@ spec:
       cidrBlocks:
       - 10.96.0.0/12
   controlPlaneRef:
-    apiGroup: controlplane.cluster.x-k8s.io/v1beta2
+    apiGroup: controlplane.cluster.x-k8s.io
     kind: KubeadmControlPlane
     name: child-1-control-plane
   infrastructureRef:
-    apiGroup: infrastructure.cluster.x-k8s.io/v1beta2
+    apiGroup: infrastructure.cluster.x-k8s.io
     kind: DockerCluster
     name: child-1
 ---
@@ -100,12 +100,12 @@ spec:
     spec:
       bootstrap:
         configRef:
-          apiGroup: bootstrap.cluster.x-k8s.io/v1beta2
+          apiGroup: bootstrap.cluster.x-k8s.io
           kind: KubeadmConfigTemplate
           name: child-1-md-0
       clusterName: child-1
       infrastructureRef:
-        apiGroup: infrastructure.cluster.x-k8s.io/v1beta2
+        apiGroup: infrastructure.cluster.x-k8s.io
         kind: DockerMachineTemplate
         name: child-1-md-0
       version: v1.29.2
