@@ -24,4 +24,3 @@ spec:
     ref: "refs/heads/main"
     path: "./clusters/management"
     interval: 1m
-    pullSecret: "flux-system"
