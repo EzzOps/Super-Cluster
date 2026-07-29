@@ -22,7 +22,6 @@ env:
     -o UserKnownHostsFile=/dev/null
     -o LogLevel=ERROR
   CAPI_VERSION: v1.13.4
-  SVELTOS_VERSION: v1.13.0
 
 jobs:
   bootstrap:
@@ -98,17 +97,22 @@ jobs:
           kubectl wait --for=condition=Available deployment/capi-controller-manager -n capi-system --timeout=5m 2>/dev/null || true
           kubectl wait --for=condition=Available deployment/capd-controller-manager -n capd-system --timeout=5m 2>/dev/null || true
           kubectl get pods -A | grep -E "capi|capd|NAME" || true
-      - name: Create git secret
+      - name: Create git secret for Flux
         env:
           KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
           GH_PAT: ${{ secrets.GH_PAT }}
         run: envsubst < clusters/management/flux-operator/git-secret.yaml | kubectl apply -f -
-      - name: Install Flux + FluxInstance
+      - name: Install Flux Operator
         env:
           KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
         run: |
-          kubectl apply -f clusters/management/flux-operator/install.yaml 2>/dev/null || true
+          kubectl apply -f clusters/management/flux-operator/install.yaml
           kubectl wait --for=condition=Available deployment/flux-operator -n flux-system --timeout=3m 2>/dev/null || true
+          echo "Flux Operator installed"
+      - name: Bootstrap FluxInstance (creates Flux controllers via OCI)
+        env:
+          KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
+        run: |
           kubectl apply -f clusters/management/flux-operator/flux-instance.yaml
           for i in $(seq 1 30); do
             kubectl get deployment source-controller -n flux-system &>/dev/null && break
@@ -121,27 +125,28 @@ jobs:
         env:
           KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
         run: kubectl apply -f clusters/management/flux-operator/flux-web-nodeport.yaml
-      - name: Install Sveltos (pinned in-repo)
+      - name: Wait for Flux to reconcile and install Sveltos via Helm
         env:
           KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
         run: |
-          kubectl apply -f clusters/management/sveltos/crds/
-          kubectl apply -f clusters/management/sveltos/sveltos-addon-controller.yaml
-          kubectl wait --for=condition=Available deployment/addon-controller -n projectsveltos --timeout=3m
-          kubectl get pods -n projectsveltos
-      - name: Force Flux reconcile
-        env:
-          KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
-        run: |
+          echo "Flux will now reconcile the management/ kustomization..."
           kubectl annotate --overwrite gitrepository/flux-system -n flux-system \
             flux.fluxcd.io/reconcileAt="$(date +%s)"
           sleep 15
+          echo "Flux will install Sveltos via HelmRelease (CRDs + addon-controller)"
+          echo "Sveltos ClusterProfiles will auto-deploy add-ons when Sveltos is ready"
           kubectl get clusters -A -o wide 2>/dev/null || echo "No clusters yet"
-          kubectl get clusterprofile 2>/dev/null || echo "No ClusterProfiles yet"
-      - name: Inject child kubeconfigs
+      - name: Wait for Sveltos and child clusters
         env:
           KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
         run: |
+          echo "Waiting for Sveltos addon-controller..."
+          for i in $(seq 1 30); do
+            kubectl get deployment addon-controller -n projectsveltos &>/dev/null && { echo "Sveltos ready"; break; }
+            sleep 10
+          done
+          kubectl wait --for=condition=Available deployment/addon-controller -n projectsveltos --timeout=5m 2>/dev/null || true
+          echo "Waiting for child clusters..."
           CHILD_CLUSTERS="${{ steps.config.outputs.child_clusters }}"
           for child in $CHILD_CLUSTERS; do
             for i in $(seq 1 36); do
@@ -157,9 +162,9 @@ jobs:
             if [ -s "/tmp/kubeconfigs/$child.yaml" ]; then
               kubectl create secret generic "kubeconfig-$child" -n flux-system \
                 --from-file=value=/tmp/kubeconfigs/$child.yaml --dry-run=client -o yaml | kubectl apply -f -
+              echo "  kubeconfig secret for $child injected"
             fi
           done
           kubectl get clusters -A -o wide || true
           kubectl get machines -A -o wide || true
-      - name: Summary
-        run: echo "CAPI: ${CAPI_VERSION}, Sveltos: ${SVELTOS_VERSION}"
+          kubectl get helmrelease -A -o wide 2>/dev/null || true

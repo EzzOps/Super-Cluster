@@ -1,7 +1,10 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-- clusterprofile-baseline.yaml
-- clusterprofile-monitoring.yaml
-- clusterprofile-capi-bootstrap.yaml
-- child-1-sveltoscluster.yaml
+  - helm-repository.yaml
+  - helm-release-crds.yaml
+  - helm-release-addon-controller.yaml
+  - clusterprofile-baseline.yaml
+  - clusterprofile-monitoring.yaml
+  - clusterprofile-capi-bootstrap.yaml
+  - child-1-sveltoscluster.yaml

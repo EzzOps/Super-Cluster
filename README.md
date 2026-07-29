@@ -21,14 +21,14 @@ clusters/
     │   ├── flux-instance.yaml
     │   ├── flux-web-nodeport.yaml
     │   └── git-secret.yaml       # Template (\${GH_PAT} injected by CI)
-    └── sveltos/                  # Sveltos ClusterProfiles
+    └── sveltos/                  # Sveltos (HelmRelease) ClusterProfiles
         ├── kustomization.yaml
         ├── clusterprofile-baseline.yaml
         ├── clusterprofile-capi-bootstrap.yaml (Cilium CNI)
         ├── clusterprofile-monitoring.yaml
         ├── child-1-sveltoscluster.yaml
-        ├── sveltos-addon-controller.yaml    # Pinned manifest
-        └── crds/                           # Pinned libsveltos CRDs
+        ├── helm-release-addon-controller.yaml  # HelmRelease
+        └── helm-release-crds.yaml            # HelmRelease for CRDs
 ```
 
 ## Bootstrap
@@ -40,12 +40,12 @@ The workflow handles:
 2. Docker (required for CAPD)
 3. `clusterctl init` with pinned CAPI v1.13.4
 4. Flux Operator + FluxInstance
-5. Sveltos addon-controller (pinned manifest in-repo)
+5. Sveltos (HelmRelease) addon-controller (pinned manifest in-repo)
 6. Child cluster kubeconfig injection
 
 After bootstrap, everything is GitOps-driven:
 - **CAPI manifests**: Edit `clusters/child/*/cluster.yaml` -> Flux syncs -> CAPI provisions
-- **Add-ons**: Edit Sveltos ClusterProfiles -> Flux syncs -> Sveltos deploys
+- **Add-ons**: Edit Sveltos (HelmRelease) ClusterProfiles -> Flux syncs -> Sveltos deploys
 - **Apps**: Add manifests to `clusters/child/*/apps/`
 
 ## Current Versions
@@ -56,12 +56,12 @@ After bootstrap, everything is GitOps-driven:
 | CAPD | v1.13.4 | clusterctl (workflow) |
 | Flux | 2.x | Flux Operator (OCI) |
 | Flux Operator | v0.54.1 | Manifest |
-| Sveltos | v1.13.0 | Pinned manifest |
-| Cilium | 1.19.6 | Sveltos ClusterProfile |
-| cert-manager | v1.15.0 | Sveltos ClusterProfile |
-| metrics-server | v0.7.1 | Sveltos ClusterProfile |
-| kube-prometheus-stack | 60.0.0 | Sveltos ClusterProfile |
-| Loki | 2.9.0 | Sveltos ClusterProfile |
+| Sveltos (HelmRelease) | v1.13.0 | Pinned manifest |
+| Cilium | 1.19.6 | Sveltos (HelmRelease) ClusterProfile |
+| cert-manager | v1.15.0 | Sveltos (HelmRelease) ClusterProfile |
+| metrics-server | v0.7.1 | Sveltos (HelmRelease) ClusterProfile |
+| kube-prometheus-stack | 60.0.0 | Sveltos (HelmRelease) ClusterProfile |
+| Loki | 2.9.0 | Sveltos (HelmRelease) ClusterProfile |
 
 ## Adding a New Child Cluster
 
