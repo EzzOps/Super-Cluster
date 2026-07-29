@@ -1,0 +1,6 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Per-cluster app deployments go here.
+# Add your application YAMLs as resources below:
+# resources:
+#   - my-app.yaml

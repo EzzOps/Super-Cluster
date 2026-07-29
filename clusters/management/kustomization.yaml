@@ -4,4 +4,6 @@ resources:
   - child-1-apps.yaml
   - remote-child-kustomization.yaml
   - sveltos/
-# last-updated: 2026-07-17T13:45:00 (removed child-2 for resource constraints)
+  - flux-operator/flux-instance.yaml
+  - flux-operator/flux-web-nodeport.yaml
+  - flux-operator/git-secret.yaml

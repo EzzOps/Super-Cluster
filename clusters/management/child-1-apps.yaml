@@ -5,7 +5,7 @@ metadata:
   namespace: flux-system
 spec:
   interval: 5m
-  path: ./clusters/child/child-1
+  path: ./clusters/child/child-1/apps
   prune: true
   sourceRef:
     kind: GitRepository

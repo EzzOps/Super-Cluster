@@ -1,16 +1,15 @@
-name: Manage Management Cluster (desired state)
+name: Bootstrap & Sync Management Cluster
 concurrency:
   group: provision-capi-management-cluster
   cancel-in-progress: true
+
 on:
   push:
     branches: [main]
     paths:
-      - '.github/workflows/provision-capi-management-cluster.yml'
-      - 'clusters/**'
+      - .github/workflows/**
+      - clusters/**
   workflow_dispatch:
-  schedule:
-    - cron: '0 */6 * * *'
 
 permissions:
   contents: write
@@ -22,73 +21,44 @@ env:
     -o PubkeyAuthentication=no
     -o UserKnownHostsFile=/dev/null
     -o LogLevel=ERROR
+  CAPI_VERSION: v1.13.4
+  SVELTOS_VERSION: v1.13.0
 
 jobs:
-  setup:
+  bootstrap:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 30
     outputs:
       child_clusters: ${{ steps.config.outputs.child_clusters }}
-      k8s_version: ${{ steps.config.outputs.k8s_version }}
-
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v30
         with:
           nix_path: nixpkgs=channel:nixos-unstable
-
-      - name: Discover cluster config from repo
+      - name: Discover child clusters
         id: config
-        run: |
-          CHILD_CLUSTERS=$(ls -d clusters/child/*/ 2>/dev/null | xargs -I{} basename {} | tr '\n' ' ')
-          CHILD_CLUSTERS="${CHILD_CLUSTERS:-child-1 child-2}"
-          echo "child_clusters=${CHILD_CLUSTERS}" >> $GITHUB_OUTPUT
-          K8S_VERSION=$(grep -h 'version: v' clusters/child/*/cluster.yaml 2>/dev/null | head -1 | awk '{print $2}')
-          echo "k8s_version=${K8S_VERSION:-v1.29.2}" >> $GITHUB_OUTPUT
-          echo "Discovered: ${CHILD_CLUSTERS} @ ${K8S_VERSION:-v1.29.2}"
-
-      - name: Verify tools
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
-          echo "kubectl: $(kubectl version --client --output=json | python3 -c 'import json,sys; print(json.load(sys.stdin)["clientVersion"]["gitVersion"])')"
-          echo "flux:    $(flux --version | head -1)"
-
-      - name: SSH connectivity check
+          CHILD_CLUSTERS=$(ls -d clusters/child/*/ 2>/dev/null | xargs -I{} basename {} | tr n  )
+          echo "child_clusters=${CHILD_CLUSTERS}" >> $GITHUB_OUTPUT
+      - name: Install clusterctl
+        run: |
+          curl -sL "https://github.com/kubernetes-sigs/cluster-api/releases/download/${CAPI_VERSION}/clusterctl-linux-amd64" -o /usr/local/bin/clusterctl
+          chmod +x /usr/local/bin/clusterctl
+          echo "clusterctl: $(clusterctl version 2>&1 | head -1)"
+      - name: SSH connectivity
         shell: nix-shell shell.nix --run "bash {0}"
         env:
           SSHPASS: ${{ secrets.PASSWORD }}
         run: sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" "echo SSH_OK"
-
-  deploy:
-    runs-on: ubuntu-latest
-    needs: setup
-    timeout-minutes: 25
-
-    steps:
-      - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v30
-        with:
-          nix_path: nixpkgs=channel:nixos-unstable
-
-      # ── 0. clusterctl + flux-operator CLI ──
-      - name: Install CLI tools
-        run: |
-          curl -sL https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64 -o /usr/local/bin/clusterctl
-          chmod +x /usr/local/bin/clusterctl
-          curl -sL https://github.com/controlplaneio-fluxcd/flux-operator/releases/download/v0.54.1/flux-operator_0.54.1_linux_amd64.tar.gz -o /tmp/flux-op.tar.gz
-          tar xzf /tmp/flux-op.tar.gz -C /usr/local/bin/ flux-operator
-          chmod +x /usr/local/bin/flux-operator
-          echo "clusterctl: $(clusterctl version 2>&1 | head -1)"
-
-      # ── 1. K3s ──
-      - name: Ensure K3s is running
+      - name: Ensure K3s
         shell: nix-shell shell.nix --run "bash {0}"
         env:
           SSHPASS: ${{ secrets.PASSWORD }}
         run: |
-          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" bash -s <<'REMOTE'
+          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" bash -s << REMOTE
           set -euo pipefail
-          if command -v k3s >/dev/null 2>&1 && systemctl is-active --quiet k3s; then
+          if command -v k3s && systemctl is-active --quiet k3s; then
             echo "K3s already running"
           else
             curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode=644" sh -
@@ -99,209 +69,97 @@ jobs:
             sleep 2
           done
           REMOTE
-
-      # ── 2. Docker ──
-      - name: Ensure Docker is installed
+      - name: Ensure Docker
         shell: nix-shell shell.nix --run "bash {0}"
         env:
           SSHPASS: ${{ secrets.PASSWORD }}
         run: |
-          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" bash -s <<'REMOTE'
-          set -euo pipefail
-          command -v docker >/dev/null 2>&1 || curl -fsSL https://get.docker.com | sh
+          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" bash -s << REMOTE
+          command -v docker || curl -fsSL https://get.docker.com | sh
           docker version
           REMOTE
-
-      # ── 3. Kubeconfig ──
-      - name: Retrieve management kubeconfig
+      - name: Retrieve kubeconfig
         shell: nix-shell shell.nix --run "bash {0}"
         env:
           SSHPASS: ${{ secrets.PASSWORD }}
         run: |
           mkdir -p /tmp/kubeconfigs
-          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}"             'sudo cat /etc/rancher/k3s/k3s.yaml' > /tmp/kubeconfigs/mgmt.yaml
+          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" \
+            sudo cat /etc/rancher/k3s/k3s.yaml > /tmp/kubeconfigs/mgmt.yaml
           sed -i "s/127.0.0.1/${{ secrets.HOST }}/g" /tmp/kubeconfigs/mgmt.yaml
-
-      # ── 4. Install CAPI (skip if already installed) ──
-      - name: Install Cluster API (CAPD)
-        shell: nix-shell shell.nix --run "bash {0}"
+      - name: Install CAPI (pinned versions)
+        env:
+          KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
         run: |
-          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          echo "Initializing CAPI with Docker provider..."
-          clusterctl init --infrastructure docker 2>&1 || true
+          clusterctl init --infrastructure docker \
+            --core cluster-api:${CAPI_VERSION} \
+            --bootstrap kubeadm:${CAPI_VERSION} \
+            --control-plane kubeadm:${CAPI_VERSION} 2>&1 || true
           kubectl wait --for=condition=Available deployment/capi-controller-manager -n capi-system --timeout=5m 2>/dev/null || true
           kubectl wait --for=condition=Available deployment/capd-controller-manager -n capd-system --timeout=5m 2>/dev/null || true
-          echo "=== CAPI pods ==="
-          kubectl get pods -A | grep -E "capi|capd|NAME" 2>/dev/null
-
-      # ── 5. Enable ClusterTopology feature gate (required for spec.topology) ──
-      - name: Enable ClusterTopology feature gate on CAPI
-        shell: nix-shell shell.nix --run "bash {0}"
-        run: |
-          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          echo "Patching CAPI controller manager to enable ClusterTopology..."
-
-          # Patch the capi-controller-manager deployment to add CLUSTER_TOPOLOGY=true
-          kubectl patch deployment capi-controller-manager -n capi-system --type='json' -p='[
-            {"op": "add", "path": "/spec/template/spec/containers/0/env/-", "value": {"name": "CLUSTER_TOPOLOGY", "value": "true"}}
-          ]' 2>/dev/null || echo "Patch add failed, trying replace..."
-
-          # If add fails (env already exists), try setting it
-          kubectl set env deployment/capi-controller-manager -n capi-system CLUSTER_TOPOLOGY=true 2>/dev/null || true
-
-          echo "Waiting for CAPI controller to restart with ClusterTopology enabled..."
-          kubectl rollout status deployment/capi-controller-manager -n capi-system --timeout=3m 2>/dev/null || true
-          kubectl wait --for=condition=Available deployment/capi-controller-manager -n capi-system --timeout=3m 2>/dev/null || true
-
-          echo ""
-          echo "=== Verifying ClusterTopology feature gate ==="
-          CAPTURE=$(kubectl get deploy capi-controller-manager -n capi-system -o jsonpath='{.spec.template.spec.containers[0].env}' 2>/dev/null)
-          if [ -n "$CAPTURE" ]; then
-            if echo "$CAPTURE" | grep -q "CLUSTER_TOPOLOGY"; then
-              echo "  CLUSTER_TOPOLOGY=true"
-            else
-              echo "  CLUSTER_TOPOLOGY not set in env"
-            fi
-          else
-            echo "  (could not verify)"
-          fi
-
-      # ── 6. Create Git auth secret ──
-      - name: Create Git authentication secret
-        shell: nix-shell shell.nix --run "bash {0}"
+          kubectl get pods -A | grep -E "capi|capd|NAME" || true
+      - name: Create git secret
         env:
+          KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
           GH_PAT: ${{ secrets.GH_PAT }}
+        run: envsubst < clusters/management/flux-operator/git-secret.yaml | kubectl apply -f -
+      - name: Install Flux + FluxInstance
+        env:
+          KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
         run: |
-          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          envsubst < clusters/management/flux-operator/git-secret.yaml | kubectl apply -f -
-          echo "✅ Git secret injected"
-
-      # ── 7. Bootstrap Flux ──
-      - name: Bootstrap Flux (operator + FluxInstance)
-        shell: nix-shell shell.nix --run "bash {0}"
-        run: |
-          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          kubectl delete deployment flux-operator -n flux-system --ignore-not-found 2>/dev/null || true
-          flux-operator install -f clusters/management/flux-operator/flux-instance.yaml || true
-
-      - name: Wait for Flux controllers to be ready
-        shell: nix-shell shell.nix --run "bash {0}"
-        run: |
-          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          echo "⏳ Waiting for Flux controllers..."
+          kubectl apply -f clusters/management/flux-operator/install.yaml 2>/dev/null || true
+          kubectl wait --for=condition=Available deployment/flux-operator -n flux-system --timeout=3m 2>/dev/null || true
+          kubectl apply -f clusters/management/flux-operator/flux-instance.yaml
           for i in $(seq 1 30); do
-            if kubectl get deployment source-controller -n flux-system &>/dev/null 2>&1; then
-              echo "  source-controller appearing after $((i * 10))s"
-              break
-            fi
+            kubectl get deployment source-controller -n flux-system &>/dev/null && break
             sleep 10
           done
           kubectl wait --for=condition=Available deployment/source-controller -n flux-system --timeout=3m 2>/dev/null || true
           kubectl wait --for=condition=Available deployment/kustomize-controller -n flux-system --timeout=3m 2>/dev/null || true
-          echo "=== Flux components ==="
-          kubectl get pods -n flux-system | grep -E "source|kustomize|helm|notification|NAME" 2>/dev/null || echo "  (still pulling images)"
-          echo "✅ Flux bootstrapped"
-
-      - name: Apply Web UI NodePort
-        shell: nix-shell shell.nix --run "bash {0}"
+          echo "Flux controllers ready"
+      - name: Expose Flux Web UI
+        env:
+          KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
+        run: kubectl apply -f clusters/management/flux-operator/flux-web-nodeport.yaml
+      - name: Install Sveltos (pinned in-repo)
+        env:
+          KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
         run: |
-          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          kubectl apply -f clusters/management/flux-operator/flux-web-nodeport.yaml
-          echo "✅ Web UI exposed on http://${{ secrets.HOST }}:30080"
-
-      # ── 8. Install Sveltos add-on controller ──
-      - name: Install Sveltos lib CRDs + add-on controller
-        run: |
-          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          echo "Installing Sveltos libsveltos CRDs (SveltosCluster, ClusterSet, Set)..."
-          kubectl apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/main/config/crd/bases/lib.projectsveltos.io_sveltosclusters.yaml
-          kubectl apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/main/config/crd/bases/lib.projectsveltos.io_clustersets.yaml
-          kubectl apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/main/config/crd/bases/lib.projectsveltos.io_sets.yaml
-          echo "Installing Sveltos addon-controller v1.13.0..."
-          kubectl apply -f https://raw.githubusercontent.com/projectsveltos/addon-controller/v1.13.0/manifest/manifest.yaml
-          echo "⏳ Waiting for Sveltos to be ready..."
+          kubectl apply -f clusters/management/sveltos/crds/
+          kubectl apply -f clusters/management/sveltos/sveltos-addon-controller.yaml
           kubectl wait --for=condition=Available deployment/addon-controller -n projectsveltos --timeout=3m
-          echo "=== Sveltos components ==="
           kubectl get pods -n projectsveltos
-          echo "✅ Sveltos addon-controller v1.13.0 installed"
-
-      # ── 9. Trigger Flux reconcile ──
       - name: Force Flux reconcile
-        shell: nix-shell shell.nix --run "bash {0}"
+        env:
+          KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
         run: |
-          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          kubectl annotate --overwrite gitrepository/flux-system -n flux-system             flux.fluxcd.io/reconcileAt="$(date +%s)"
-          echo "Flux reconcile triggered — CAPI will provision child clusters"
-          # Sveltos auto-discovers CAPI clusters via labels
-          echo "Sveltos ClusterProfiles will auto-deploy add-ons to matching clusters"
+          kubectl annotate --overwrite gitrepository/flux-system -n flux-system \
+            flux.fluxcd.io/reconcileAt="$(date +%s)"
           sleep 15
-          echo "=== CAPI Cluster state ==="
           kubectl get clusters -A -o wide 2>/dev/null || echo "No clusters yet"
-          kubectl get kubeadmcontrolplane -A 2>/dev/null || echo "No control planes yet"
-          kubectl get machinedeployment -A 2>/dev/null || echo "No machine deployments yet"
-          echo "=== Sveltos ClusterProfile state ==="
-          kubectl get clusterprofile 2>/dev/null || echo "No ClusterProfiles yet (Flux still syncing)"
-          kubectl get clustersummary -A 2>/dev/null || echo "No ClusterSummaries yet"
-
-      - name: Wait for child clusters to provision and inject kubeconfigs into Flux
-        shell: nix-shell shell.nix --run "bash {0}"
+          kubectl get clusterprofile 2>/dev/null || echo "No ClusterProfiles yet"
+      - name: Inject child kubeconfigs
+        env:
+          KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
         run: |
-          export KUBECONFIG=/tmp/kubeconfigs/mgmt.yaml
-          CHILD_CLUSTERS="${{ needs.setup.outputs.child_clusters }}"
-          echo "================================================"
-          echo "  Waiting for child clusters to provision..."
-          echo "  Children: $CHILD_CLUSTERS"
-          echo "================================================"
+          CHILD_CLUSTERS="${{ steps.config.outputs.child_clusters }}"
           for child in $CHILD_CLUSTERS; do
-            echo "--- $child ---"
             for i in $(seq 1 36); do
-              phase=$(kubectl get cluster "$child" -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+              phase=$(kubectl get cluster "$child" -n default -o jsonpath={.status.phase} 2>/dev/null || echo "")
               if [ "$phase" = "Provisioned" ]; then
-                echo -e "  \xE2\x9C\x85 $child is Provisioned after ~$((i * 10))s"
-                break
+                echo "  $child is Provisioned after ~$((i * 10))s"; break
               fi
-              echo -e "  \xE2\x8F\xB3 $child phase: ${phase:-N/A} (retry $i/36)..."
+              echo "  $child phase: ${phase:-N/A} (retry $i/36)..."
               sleep 10
             done
+            kubectl get secret "kubeconfig-$child" -n flux-system &>/dev/null && continue
             clusterctl get kubeconfig "$child" -n default > "/tmp/kubeconfigs/$child.yaml" 2>/dev/null || true
             if [ -s "/tmp/kubeconfigs/$child.yaml" ]; then
-              echo -e "  \xF0\x9F\x94\x91 Retrieved kubeconfig for $child"
-              kubectl create secret generic "kubeconfig-$child" -n flux-system                 --from-file=value=/tmp/kubeconfigs/$child.yaml                 --dry-run=client -o yaml | kubectl apply -f -
-              echo -e "  \xE2\x9C\x85 Secret kubeconfig-$child created in flux-system"
-            else
-              echo -e "  \xE2\x9A\xA0\xEF\xB8\x8F Could not retrieve kubeconfig for $child (not yet Provisioned)"
-              echo "  Flux child-1-apps/child-2-apps will keep failing until ready."
-              echo "  Re-run this workflow after the cluster provisions."
+              kubectl create secret generic "kubeconfig-$child" -n flux-system \
+                --from-file=value=/tmp/kubeconfigs/$child.yaml --dry-run=client -o yaml | kubectl apply -f -
             fi
           done
-          echo ""
-          echo "=== Final CAPI state ==="
-          kubectl get clusters -A -o wide 2>/dev/null || echo "No clusters"
-          kubectl get machines -A -o wide 2>/dev/null || echo "No machines"
-          echo ""
-          echo "=== Sveltos ClusterSummary status ==="
-          kubectl get clustersummary -A 2>/dev/null || echo "No ClusterSummaries yet"
-
+          kubectl get clusters -A -o wide || true
+          kubectl get machines -A -o wide || true
       - name: Summary
-        run: |
-          echo "================================================"
-          echo "  Management cluster desired state applied ✓"
-          echo "================================================"
-          echo "  Components: K3s + Flux Operator + CAPI + Sveltos"
-          echo "  Flux:       GitOps (syncs clusters/management/)"
-          echo "  CAPI:       v1.7.0 + ClusterTopology enabled"
-          echo "  Sveltos:    v1.12.0 (fleet add-on controller)"
-          echo "  Cluster:    Traditional CAPI (no topology)"
-          echo "  Flux UI:    http://${{ secrets.HOST }}:30080"
-          echo "  Children:   ${{ needs.setup.outputs.child_clusters }}"
-          echo "  K8s:        ${{ needs.setup.outputs.k8s_version }}"
-          echo "================================================"
-          echo "  Child cluster add-on management via Sveltos:"
-          echo "    baseline-addons      → all clusters (metrics-server, cert-manager)"
-          echo "    capi-bootstrap-cni   → all clusters, OneTime (Cilium CNI)"
-          echo "    monitoring-prod      → env=prod clusters (kube-prometheus-stack + Loki)"
-          echo "================================================"
-          echo "  To label a child cluster for specific add-ons:"
-          echo "    kubectl label cluster <name> -n default env=prod"
-          echo "  Sveltos deploys matching add-ons automatically."
-          echo "================================================"
+        run: echo "CAPI: ${CAPI_VERSION}, Sveltos: ${SVELTOS_VERSION}"
