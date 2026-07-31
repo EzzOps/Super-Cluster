@@ -80,6 +80,9 @@ jobs:
             kubectl -n flux-system patch fluxinstance flux -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null || true
             kubectl -n flux-system delete fluxinstance flux --ignore-not-found 2>/dev/null || true
             kubectl -n flux-system delete deploy flux-operator --ignore-not-found 2>/dev/null || true
+            kubectl -n flux-system delete deploy source-controller kustomize-controller helm-controller notification-controller --ignore-not-found 2>/dev/null || true
+            # Explicitly delete ALL Flux controllers — do NOT rely on FluxInstance
+            # deletion cascading (it didn't; controllers kept running as orphans).
             # CRITICAL: while kustomize-controller/helm-controller live, deleting their
             # Kustomizations/HelmReleases would cascade-prune everything they applied
             # (incl. the CAPI child cluster). Wait until both are gone.
