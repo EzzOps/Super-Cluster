@@ -1,0 +1,41 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sveltos-addon-controller
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: super-cluster
+  source:
+    repoURL: https://projectsveltos.github.io/helm-charts
+    chart: projectsveltos
+    targetRevision: 1.12.7
+    helm:
+      valuesObject:
+        global:
+          capiOnboardAnnotation: "projectsveltos.io/onboard"
+        addonController:
+          controller:
+            image:
+              tag: v1.13.0
+          manager:
+            image:
+              tag: v1.13.0
+        accessManager:
+          enabled: false
+        sveltosClusterProxy:
+          enabled: false
+        sveltosDashboard:
+          enabled: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: projectsveltos
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

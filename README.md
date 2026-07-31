@@ -1,72 +1,93 @@
 # Super-Cluster
 
-GitOps-managed Kubernetes fleet — Cluster API (CAPI) + Flux + Sveltos.
+GitOps-managed Kubernetes fleet — Cluster API (CAPI) + ArgoCD + Sveltos.
+
+## Architecture
+
+The management cluster (K3s on the VPS) runs the GitOps control plane:
+
+- **ArgoCD** — the GitOps engine (app-of-apps pattern), installed via Helm by CI
+- **Cluster API (CAPD)** — provisions child clusters from `clusters/child/*`
+- **Sveltos** — add-on delivery into child clusters (Cilium, metrics-server,
+  cert-manager, monitoring) via ClusterProfiles
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│ Management cluster (K3s @ VPS)                                 │
+│  ├─ ArgoCD (UI: NodePort :30080)                               │
+│  │   ├─ bootstrap (app-of-apps → clusters/management/apps)     │
+│  │   ├─ capi-child-1        → clusters/child/child-1           │
+│  │   ├─ sveltos-crds        → helm chart (CRDs)                │
+│  │   ├─ sveltos-addon-ctrl  → helm chart (addon-controller)    │
+│  │   ├─ sveltos-profiles    → clusters/management/sveltos      │
+│  │   └─ child-1-apps        → clusters/child/child-1/apps      │
+│  ├─ Cluster API (CAPI + CAPD)                                  │
+│  └─ Sveltos addon-controller                                   │
+└──────────────┬────────────────────────────────────────────────┘
+               │ ArgoCD cluster secret "child-1" (registered by CI)
+        ┌──────▼──────┐
+        │   child-1   │  CAPI/Docker cluster — Cilium, metrics-server,
+        │  workloads  │  cert-manager, monitoring (via Sveltos)
+        └─────────────┘
+```
 
 ## Repository Structure
 
 ```
 clusters/
 ├── child/                        # Child cluster definitions (CAPI manifests)
-│   ├── kustomization.yaml
 │   └── child-1/
 │       ├── cluster.yaml          # CAPI Cluster, KCP, MachineDeployment
-│       ├── kustomization.yaml
-│       └── apps/                 # Per-cluster app deployments
-│           └── kustomization.yaml
-└── management/                   # Management cluster config (Flux-synced)
-    ├── kustomization.yaml
-    ├── child-1-apps.yaml         # Flux Kustomization for child-1 workloads
-    ├── remote-child-kustomization.yaml  # Flux Kustomization for CAPI clusters
-    ├── flux-operator/            # Flux operator + instance definitions
-    │   ├── flux-instance.yaml
-    │   ├── flux-web-nodeport.yaml
-    │   └── git-secret.yaml       # Template (\${GH_PAT} injected by CI)
-    └── sveltos/                  # Sveltos (HelmRelease) ClusterProfiles
-        ├── kustomization.yaml
-        ├── clusterprofile-baseline.yaml
-        ├── clusterprofile-capi-bootstrap.yaml (Cilium CNI)
-        ├── clusterprofile-monitoring.yaml
-        ├── child-1-sveltoscluster.yaml
-        ├── helm-release-addon-controller.yaml  # HelmRelease
-        └── helm-release-crds.yaml            # HelmRelease for CRDs
+│       └── apps/                 # Workloads synced INTO child-1 by ArgoCD
+└── management/                   # Management cluster config (ArgoCD-managed)
+    ├── argocd/values.yaml        # argo-cd Helm chart values (bootstrap layer)
+    ├── bootstrap.yaml            # Root app-of-apps Application (applied by CI)
+    ├── apps/                     # Synced by bootstrap → all child Applications
+    │   ├── project.yaml          # AppProject: super-cluster
+    │   ├── capi-child-1.yaml     # CAPI manifests → management cluster
+    │   ├── sveltos-crds.yaml     # Sveltos CRDs (Helm chart)
+    │   ├── sveltos-addon-controller.yaml  # Sveltos controller (Helm chart)
+    │   ├── sveltos-profiles.yaml # ClusterProfiles + SveltosCluster
+    │   └── child-1-apps.yaml     # Child workloads → child-1 cluster
+    └── sveltos/                  # Sveltos ClusterProfiles (plain YAML)
 ```
 
 ## Bootstrap
 
-GitHub Actions workflow: `.github/workflows/provision-capi-management-cluster.yml`
+GitHub Actions workflow `.github/workflows/provision-capi-management-cluster.yml`:
 
-The workflow handles:
-1. K3s installation on the VPS
-2. Docker (required for CAPD)
-3. `clusterctl init` with pinned CAPI v1.13.4
-4. Flux Operator + FluxInstance
-5. Sveltos (HelmRelease) addon-controller (pinned manifest in-repo)
-6. Child cluster kubeconfig injection
+1. Ensure K3s + Docker on the VPS
+2. `clusterctl init` with pinned CAPI v1.13.4
+3. **Decommission Flux if present** (safe order: controllers dead → CRs purged
+   with finalizers stripped → namespace removed — no cascade pruning)
+4. Install **ArgoCD** via Helm (chart pinned, values from the repo)
+5. Apply the AppProject + root bootstrap Application (app-of-apps)
+6. Wait for Sveltos + child clusters, then register child kubeconfigs:
+   - `child-1-kubeconfig` secret (ns `default`) for Sveltos
+   - ArgoCD cluster secret `child-1` (kubeconfig JSON) for remote syncs
+7. Everything after that is pure ArgoCD reconciliation
 
-After bootstrap, everything is GitOps-driven:
-- **CAPI manifests**: Edit `clusters/child/*/cluster.yaml` -> Flux syncs -> CAPI provisions
-- **Add-ons**: Edit Sveltos (HelmRelease) ClusterProfiles -> Flux syncs -> Sveltos deploys
-- **Apps**: Add manifests to `clusters/child/*/apps/`
+The workflow is idempotent — safe to re-run any time.
+
+## Day-2 Operations
+
+- **ArgoCD UI**: `http://<VPS_IP>:30080` — user `admin`, initial password is
+  printed by the workflow (also: `kubectl -n argocd get secret argocd-initial-admin-secret`)
+- **Add a child cluster**: create `clusters/child/<name>/cluster.yaml` +
+  `clusters/management/apps/capi-<name>.yaml` (+ `<name>-apps.yaml` for its
+  workloads), push to main
+- **Add workloads to child-1**: put manifests in `clusters/child/child-1/apps/`
+- **Add-ons**: edit Sveltos ClusterProfiles in `clusters/management/sveltos/`
+- **Sync waves** (app-of-apps): CAPI + Sveltos CRDs → addon-controller →
+  ClusterProfiles → child workloads
 
 ## Current Versions
 
 | Component | Version | Managed By |
 |---|---|---|
+| ArgoCD | v3.4.5 (chart 10.2.1) | Helm (workflow) |
 | Cluster API | v1.13.4 | clusterctl (workflow) |
 | CAPD | v1.13.4 | clusterctl (workflow) |
-| Flux | 2.x | Flux Operator (OCI) |
-| Flux Operator | v0.54.1 | Manifest |
-| Sveltos (HelmRelease) | v1.13.0 | Pinned manifest |
-| Cilium | 1.19.6 | Sveltos (HelmRelease) ClusterProfile |
-| cert-manager | v1.15.0 | Sveltos (HelmRelease) ClusterProfile |
-| metrics-server | v0.7.1 | Sveltos (HelmRelease) ClusterProfile |
-| kube-prometheus-stack | 60.0.0 | Sveltos (HelmRelease) ClusterProfile |
-| Loki | 2.9.0 | Sveltos (HelmRelease) ClusterProfile |
-
-## Adding a New Child Cluster
-
-1. Copy `clusters/child/child-1/` to `clusters/child/<name>/`
-2. Edit `cluster.yaml` (name, version, replicas)
-3. Add `<name>` to `clusters/child/kustomization.yaml`
-4. Create `clusters/management/sveltos/<name>-sveltoscluster.yaml`
-5. Commit -> Flux syncs -> CAPI provisions
+| Sveltos (crds chart) | 1.12.0 | ArgoCD (Helm) |
+| Sveltos (controller chart) | 1.12.7 (images v1.13.0) | ArgoCD (Helm) |
+| Cilium | 1.19.6 | Sveltos ClusterProfile |

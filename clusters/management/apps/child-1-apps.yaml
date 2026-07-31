@@ -1,0 +1,29 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: child-1-apps
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: super-cluster
+  source:
+    repoURL: https://github.com/EzzOps/Super-Cluster.git
+    targetRevision: HEAD
+    path: clusters/child/child-1/apps
+  destination:
+    # Resolved via the ArgoCD cluster secret named "child-1" (registered by CI)
+    name: child-1
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    retry:
+      limit: -1
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 5m

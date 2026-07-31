@@ -22,11 +22,12 @@ env:
     -o UserKnownHostsFile=/dev/null
     -o LogLevel=ERROR
   CAPI_VERSION: v1.13.4
+  ARGOCD_CHART_VERSION: 10.2.1
 
 jobs:
   bootstrap:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     outputs:
       child_clusters: ${{ steps.config.outputs.child_clusters }}
     steps:
@@ -38,7 +39,7 @@ jobs:
         id: config
         shell: nix-shell shell.nix --run "bash {0}"
         run: |
-          CHILD_CLUSTERS=$(ls -d clusters/child/*/ 2>/dev/null | xargs -I{} basename {} | tr n  )
+          CHILD_CLUSTERS=$(ls -d clusters/child/*/ 2>/dev/null | xargs -I{} basename {} | tr '\n' ' ')
           echo "child_clusters=${CHILD_CLUSTERS}" >> $GITHUB_OUTPUT
       - name: Install clusterctl
         run: |
@@ -97,50 +98,72 @@ jobs:
           kubectl wait --for=condition=Available deployment/capi-controller-manager -n capi-system --timeout=5m 2>/dev/null || true
           kubectl wait --for=condition=Available deployment/capd-controller-manager -n capd-system --timeout=5m 2>/dev/null || true
           kubectl get pods -A | grep -E "capi|capd|NAME" || true
-      - name: Create git secret for Flux
-        env:
-          KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
-          GH_PAT: ${{ secrets.GH_PAT }}
-        run: envsubst < clusters/management/flux-operator/git-secret.yaml | kubectl apply -f -
-      - name: Install Flux Operator
+      - name: Decommission Flux (controllers first, then CRs — no cascade pruning)
         env:
           KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
         run: |
-          kubectl apply -f clusters/management/flux-operator/install.yaml
-          kubectl wait --for=condition=Available deployment/flux-operator -n flux-system --timeout=3m 2>/dev/null || true
-          echo "Flux Operator installed"
-      - name: Bootstrap FluxInstance (creates Flux controllers via OCI)
+          if kubectl get ns flux-system &>/dev/null; then
+            echo "Flux detected — decommissioning..."
+            # Stop the operator and FluxInstance first so controllers cannot be recreated
+            kubectl -n flux-system patch fluxinstance flux -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null || true
+            kubectl -n flux-system delete fluxinstance flux --ignore-not-found 2>/dev/null || true
+            kubectl -n flux-system delete deploy flux-operator --ignore-not-found 2>/dev/null || true
+            # CRITICAL: while kustomize-controller/helm-controller live, deleting their
+            # Kustomizations/HelmReleases would cascade-prune everything they applied
+            # (incl. the CAPI child cluster). Wait until both are gone.
+            for i in $(seq 1 30); do
+              if kubectl -n flux-system get deploy kustomize-controller &>/dev/null || kubectl -n flux-system get deploy helm-controller &>/dev/null; then
+                sleep 5
+              else
+                echo "  kustomize-controller + helm-controller down after ~$((i*5))s"
+                break
+              fi
+            done
+            if kubectl -n flux-system get deploy kustomize-controller &>/dev/null || kubectl -n flux-system get deploy helm-controller &>/dev/null; then
+              echo "  FATAL: Flux controllers still running — aborting to protect the child cluster"
+              exit 1
+            fi
+            # Controllers dead → strip finalizers and purge CRs (inventory survives as orphans)
+            for res in kustomizations gitrepositories helmrepositories; do
+              kubectl -n flux-system get "$res" -o name 2>/dev/null | xargs -r -I{} kubectl -n flux-system patch {} -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null || true
+              kubectl -n flux-system delete "$res" --all --ignore-not-found 2>/dev/null || true
+            done
+            kubectl -n projectsveltos get helmreleases -o name 2>/dev/null | xargs -r -I{} kubectl -n projectsveltos patch {} -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null || true
+            kubectl -n projectsveltos delete helmrelease --all --ignore-not-found 2>/dev/null || true
+            kubectl delete ns flux-system --ignore-not-found 2>/dev/null || true
+            echo "Flux decommissioned — ArgoCD owns the stack from here"
+          else
+            echo "No Flux found — nothing to decommission"
+          fi
+      - name: Install ArgoCD (Helm)
         env:
           KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
         run: |
-          kubectl apply -f clusters/management/flux-operator/flux-instance.yaml
-          for i in $(seq 1 30); do
-            kubectl get deployment source-controller -n flux-system &>/dev/null && break
-            sleep 10
-          done
-          kubectl wait --for=condition=Available deployment/source-controller -n flux-system --timeout=3m 2>/dev/null || true
-          kubectl wait --for=condition=Available deployment/kustomize-controller -n flux-system --timeout=3m 2>/dev/null || true
-          echo "Flux controllers ready"
-      - name: Expose Flux Web UI
-        env:
-          KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
-        run: kubectl apply -f clusters/management/flux-operator/flux-web-nodeport.yaml
-      - name: Wait for Flux to reconcile and install Sveltos via Helm
+          helm repo add argo https://argoproj.github.io/argo-helm
+          helm upgrade --install argocd argo/argo-cd \
+            --namespace argocd --create-namespace \
+            --version "${ARGOCD_CHART_VERSION}" \
+            --values clusters/management/argocd/values.yaml \
+            --wait --timeout 5m
+          kubectl wait --for=condition=Available deployment/argocd-server -n argocd --timeout=3m 2>/dev/null || true
+          kubectl wait --for=condition=Available deployment/argocd-application-controller -n argocd --timeout=3m 2>/dev/null || true
+          kubectl wait --for=condition=Available deployment/argocd-repo-server -n argocd --timeout=3m 2>/dev/null || true
+          kubectl get pods -n argocd
+      - name: Bootstrap app-of-apps (AppProject + root Application)
         env:
           KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
         run: |
-          echo "Flux will now reconcile the management/ kustomization..."
-          kubectl annotate --overwrite gitrepository/flux-system -n flux-system \
-            flux.fluxcd.io/reconcileAt="$(date +%s)"
-          sleep 15
-          echo "Flux will install Sveltos via HelmRelease (CRDs + addon-controller)"
-          echo "Sveltos ClusterProfiles will auto-deploy add-ons when Sveltos is ready"
-          kubectl get clusters -A -o wide 2>/dev/null || echo "No clusters yet"
+          kubectl apply -f clusters/management/apps/project.yaml
+          kubectl apply -f clusters/management/bootstrap.yaml
+          echo "ArgoCD will now reconcile:"
+          echo "  - CAPI clusters    (clusters/child/*)"
+          echo "  - Sveltos          (Helm charts + ClusterProfiles)"
+          echo "  - Child workloads  (clusters/child/*/apps)"
       - name: Wait for Sveltos and child clusters
         env:
           KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
         run: |
-          echo "Waiting for Sveltos addon-controller..."
+          echo "Waiting for Sveltos addon-controller (installed via ArgoCD)..."
           for i in $(seq 1 30); do
             kubectl get deployment addon-controller -n projectsveltos &>/dev/null && { echo "Sveltos ready"; break; }
             sleep 10
@@ -157,14 +180,51 @@ jobs:
               echo "  $child phase: ${phase:-N/A} (retry $i/36)..."
               sleep 10
             done
-            kubectl get secret "kubeconfig-$child" -n flux-system &>/dev/null && continue
             clusterctl get kubeconfig "$child" -n default > "/tmp/kubeconfigs/$child.yaml" 2>/dev/null || true
             if [ -s "/tmp/kubeconfigs/$child.yaml" ]; then
-              kubectl create secret generic "kubeconfig-$child" -n flux-system \
-                --from-file=value=/tmp/kubeconfigs/$child.yaml --dry-run=client -o yaml | kubectl apply -f -
-              echo "  kubeconfig secret for $child injected"
+              # 1) Sveltos: SveltosCluster <child> consumes secret <child>-kubeconfig (ns default)
+              kubectl create secret generic "$child-kubeconfig" -n default \
+                --from-file=value="/tmp/kubeconfigs/$child.yaml" --dry-run=client -o yaml | kubectl apply -f -
+              echo "  OK kubeconfig secret '$child-kubeconfig' injected for Sveltos"
+              # 2) ArgoCD: register <child> as a managed cluster (apps use destination.name)
+              kubectl config view --kubeconfig="/tmp/kubeconfigs/$child.yaml" --flatten -o json > "/tmp/kubeconfigs/$child.json"
+              SERVER=$(python3 -c "import json;print(json.load(open('/tmp/kubeconfigs/$child.json'))['clusters'][0]['cluster']['server'])")
+              CONFIG=$(python3 -c "import json;print(json.dumps(json.load(open('/tmp/kubeconfigs/$child.json'))))")
+                    kubectl apply -f - <<EOF
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: $child
+            namespace: argocd
+            labels:
+              argocd.argoproj.io/secret-type: cluster
+          stringData:
+            name: $child
+            server: $SERVER
+            config: |
+              $CONFIG
+          EOF
+              echo "  OK ArgoCD cluster '$child' registered ($SERVER)"
+              kubectl -n argocd annotate application "${child}-apps" argocd.argoproj.io/refresh="$(date +%s)" --overwrite 2>/dev/null || true
             fi
           done
           kubectl get clusters -A -o wide || true
           kubectl get machines -A -o wide || true
-          kubectl get helmrelease -A -o wide 2>/dev/null || true
+          kubectl get applications -n argocd || true
+      - name: Summary
+        env:
+          KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
+        run: |
+          echo "=============================================="
+          echo "  Super-Cluster GitOps pipeline done (ArgoCD)"
+          echo "=============================================="
+          echo "  ArgoCD UI : http://${{ secrets.HOST }}:30080"
+          echo "  User      : admin"
+          PASS=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' 2>/dev/null | base64 -d)
+          echo "  Password  : ${PASS:-<run: kubectl -n argocd get secret argocd-initial-admin-secret>}"
+          echo "=============================================="
+          echo "  To add a new child cluster:"
+          echo "    1. Create clusters/child/<name>/cluster.yaml"
+          echo "    2. Add clusters/management/apps/capi-<name>.yaml (+ <name>-apps.yaml)"
+          echo "    3. Push to main — ArgoCD + CAPI auto-provisions"
+          echo "=============================================="

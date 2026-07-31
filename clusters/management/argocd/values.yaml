@@ -1,0 +1,14 @@
+# ArgoCD installation values (argo-cd Helm chart)
+# Applied by the bootstrap workflow (the only imperative layer) via:
+#   helm upgrade --install argocd argo/argo-cd -n argocd --create-namespace \
+#     --version <pinned> --values clusters/management/argocd/values.yaml
+server:
+  service:
+    type: NodePort
+    # Keep the same port the Flux web UI used to occupy (30080)
+    nodePortHttp: 30080
+
+configs:
+  params:
+    # Serve the UI over plain HTTP on the NodePort — no TLS cert management
+    server.insecure: "true"

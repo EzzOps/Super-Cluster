@@ -1,0 +1,22 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: super-cluster
+  namespace: argocd
+spec:
+  description: Super-Cluster platform — CAPI clusters, Sveltos add-ons, workloads
+  sourceRepos:
+    - 'https://github.com/EzzOps/Super-Cluster.git'
+    - 'https://projectsveltos.github.io/helm-charts'
+  destinations:
+    - name: in-cluster
+      namespace: '*'
+      server: https://kubernetes.default.svc
+    - name: child-1
+      namespace: '*'
+  clusterResourceWhitelist:
+    - group: '*'
+      kind: '*'
+  namespaceResourceWhitelist:
+    - group: '*'
+      kind: '*'
