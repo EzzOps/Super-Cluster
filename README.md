@@ -54,9 +54,23 @@ clusters/
 
 ## Bootstrap
 
-GitHub Actions workflow `.github/workflows/provision-capi-management-cluster.yml`:
+The management cluster runs a **self-hosted GitHub Actions runner** (user
+`ghrunner`, service `actions.runner.EzzOps-Super-Cluster.vps-runner`) — the VPS
+stays fully locked down (no inbound SSH for CI, tailnet-only access).
 
-1. Ensure K3s + Docker on the VPS
+**One-time runner setup** (run on the VPS as root, e.g. over tailnet):
+
+```bash
+curl -fsSL -o /tmp/runner-setup.sh https://raw.githubusercontent.com/EzzOps/Super-Cluster/main/scripts/runner-setup.sh
+chmod +x /tmp/runner-setup.sh
+# registration token: gh api repos/EzzOps/Super-Cluster/actions/runners/registration-token -X POST -H "Authorization: token <PAT>" | jq -r .token
+/tmp/runner-setup.sh <registration-token>
+```
+
+Then every push to `main` (or `workflow_dispatch`) runs **on the VPS** via the
+workflow `.github/workflows/provision-capi-management-cluster.yml`:
+
+1. Ensure K3s + Docker are running (local systemd/docker)
 2. `clusterctl init` with pinned CAPI v1.13.4
 3. **Decommission Flux if present** (safe order: controllers dead → CRs purged
    with finalizers stripped → namespace removed — no cascade pruning)
@@ -68,6 +82,11 @@ GitHub Actions workflow `.github/workflows/provision-capi-management-cluster.yml
 7. Everything after that is pure ArgoCD reconciliation
 
 The workflow is idempotent — safe to re-run any time.
+
+> ⚠️ **Self-hosted runner on a public repo**: the runner executes code from
+> `main` only (push + workflow_dispatch; never PRs), so only collaborators with
+> write access can trigger it. Old `HOST`/`USER`/`PASSWORD`/`GH_PAT` secrets
+> are no longer used and can be deleted.
 
 ## Day-2 Operations
 

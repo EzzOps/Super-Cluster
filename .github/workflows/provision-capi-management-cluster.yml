@@ -15,81 +15,54 @@ permissions:
   contents: write
 
 env:
-  SSH_OPTS: >-
-    -o StrictHostKeyChecking=no
-    -o PreferredAuthentications=password
-    -o PubkeyAuthentication=no
-    -o UserKnownHostsFile=/dev/null
-    -o LogLevel=ERROR
   CAPI_VERSION: v1.13.4
   ARGOCD_CHART_VERSION: 10.2.1
+  KUBECONFIG: /etc/rancher/k3s/k3s.yaml
 
 jobs:
   bootstrap:
-    runs-on: ubuntu-latest
+    # Self-hosted runner on the VPS (see scripts/runner-setup.sh) — no inbound SSH needed
+    runs-on: [self-hosted, linux, vps]
     timeout-minutes: 40
     outputs:
       child_clusters: ${{ steps.config.outputs.child_clusters }}
     steps:
       - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v30
-        with:
-          nix_path: nixpkgs=channel:nixos-unstable
+
       - name: Discover child clusters
         id: config
-        shell: nix-shell shell.nix --run "bash {0}"
         run: |
           CHILD_CLUSTERS=$(ls -d clusters/child/*/ 2>/dev/null | xargs -I{} basename {} | tr '\n' ' ')
           echo "child_clusters=${CHILD_CLUSTERS}" >> $GITHUB_OUTPUT
-      - name: Install clusterctl
+
+      - name: Ensure tooling (kubectl, helm, clusterctl)
         run: |
-          curl -sL "https://github.com/kubernetes-sigs/cluster-api/releases/download/${CAPI_VERSION}/clusterctl-linux-amd64" -o /usr/local/bin/clusterctl
-          chmod +x /usr/local/bin/clusterctl
-          echo "clusterctl: $(clusterctl version 2>&1 | head -1)"
-      - name: SSH connectivity
-        shell: nix-shell shell.nix --run "bash {0}"
-        env:
-          SSHPASS: ${{ secrets.PASSWORD }}
-        run: sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" "echo SSH_OK"
+          command -v kubectl >/dev/null || { KUBE_VER=$(curl -fsSL https://dl.k8s.io/release/stable.txt); sudo curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBE_VER}/bin/linux/amd64/kubectl"; sudo chmod +x /usr/local/bin/kubectl; }
+          command -v helm >/dev/null || curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | sudo bash
+          command -v clusterctl >/dev/null || { sudo curl -fsSLo /usr/local/bin/clusterctl "https://github.com/kubernetes-sigs/cluster-api/releases/download/${CAPI_VERSION}/clusterctl-linux-amd64"; sudo chmod +x /usr/local/bin/clusterctl; }
+          echo "kubectl: $(kubectl version --client 2>/dev/null | head -1) | helm: $(helm version --short 2>/dev/null) | clusterctl: $(clusterctl version 2>&1 | head -1)"
+
       - name: Ensure K3s
-        shell: nix-shell shell.nix --run "bash {0}"
-        env:
-          SSHPASS: ${{ secrets.PASSWORD }}
         run: |
-          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" bash -s << REMOTE
-          set -euo pipefail
-          if command -v k3s && systemctl is-active --quiet k3s; then
+          if systemctl is-active --quiet k3s 2>/dev/null; then
             echo "K3s already running"
           else
-            curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode=644" sh -
-            systemctl enable --now k3s
+            curl -fsSL https://get.k3s.io -o /tmp/k3s-install.sh
+            sudo INSTALL_K3S_EXEC="--write-kubeconfig-mode=644" sh /tmp/k3s-install.sh
+            sudo systemctl enable --now k3s
           fi
           for i in $(seq 1 30); do
             kubectl get nodes --no-headers 2>/dev/null | grep -q Ready && { echo "K3s ready after ${i}s"; break; }
             sleep 2
           done
-          REMOTE
+          kubectl get nodes -o wide
+
       - name: Ensure Docker
-        shell: nix-shell shell.nix --run "bash {0}"
-        env:
-          SSHPASS: ${{ secrets.PASSWORD }}
         run: |
-          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" bash -s << REMOTE
-          command -v docker || curl -fsSL https://get.docker.com | sh
+          command -v docker >/dev/null || { curl -fsSL https://get.docker.com | sudo sh; }
           docker version
-          REMOTE
-      - name: Retrieve kubeconfig
-        shell: nix-shell shell.nix --run "bash {0}"
-        env:
-          SSHPASS: ${{ secrets.PASSWORD }}
-        run: |
-          mkdir -p /tmp/kubeconfigs
-          sshpass -e ssh $SSH_OPTS "${{ secrets.USER }}@${{ secrets.HOST }}" \
-            sudo cat /etc/rancher/k3s/k3s.yaml > /tmp/kubeconfigs/mgmt.yaml
-          sed -i "s/127.0.0.1/${{ secrets.HOST }}/g" /tmp/kubeconfigs/mgmt.yaml
+
       - name: Install CAPI (pinned versions)
-        env:
-          KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
         run: |
           clusterctl init --infrastructure docker \
             --core cluster-api:${CAPI_VERSION} \
@@ -98,9 +71,8 @@ jobs:
           kubectl wait --for=condition=Available deployment/capi-controller-manager -n capi-system --timeout=5m 2>/dev/null || true
           kubectl wait --for=condition=Available deployment/capd-controller-manager -n capd-system --timeout=5m 2>/dev/null || true
           kubectl get pods -A | grep -E "capi|capd|NAME" || true
+
       - name: Decommission Flux (controllers first, then CRs — no cascade pruning)
-        env:
-          KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
         run: |
           if kubectl get ns flux-system &>/dev/null; then
             echo "Flux detected — decommissioning..."
@@ -135,9 +107,8 @@ jobs:
           else
             echo "No Flux found — nothing to decommission"
           fi
+
       - name: Install ArgoCD (Helm)
-        env:
-          KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
         run: |
           helm repo add argo https://argoproj.github.io/argo-helm
           helm upgrade --install argocd argo/argo-cd \
@@ -149,9 +120,8 @@ jobs:
           kubectl wait --for=condition=Available deployment/argocd-application-controller -n argocd --timeout=3m 2>/dev/null || true
           kubectl wait --for=condition=Available deployment/argocd-repo-server -n argocd --timeout=3m 2>/dev/null || true
           kubectl get pods -n argocd
+
       - name: Bootstrap app-of-apps (AppProject + root Application)
-        env:
-          KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
         run: |
           kubectl apply -f clusters/management/apps/project.yaml
           kubectl apply -f clusters/management/bootstrap.yaml
@@ -159,9 +129,8 @@ jobs:
           echo "  - CAPI clusters    (clusters/child/*)"
           echo "  - Sveltos          (Helm charts + ClusterProfiles)"
           echo "  - Child workloads  (clusters/child/*/apps)"
+
       - name: Wait for Sveltos and child clusters
-        env:
-          KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
         run: |
           echo "Waiting for Sveltos addon-controller (installed via ArgoCD)..."
           for i in $(seq 1 30); do
@@ -171,6 +140,7 @@ jobs:
           kubectl wait --for=condition=Available deployment/addon-controller -n projectsveltos --timeout=5m 2>/dev/null || true
           echo "Waiting for child clusters..."
           CHILD_CLUSTERS="${{ steps.config.outputs.child_clusters }}"
+          mkdir -p /tmp/kubeconfigs
           for child in $CHILD_CLUSTERS; do
             for i in $(seq 1 36); do
               phase=$(kubectl get cluster "$child" -n default -o jsonpath={.status.phase} 2>/dev/null || echo "")
@@ -211,14 +181,13 @@ jobs:
           kubectl get clusters -A -o wide || true
           kubectl get machines -A -o wide || true
           kubectl get applications -n argocd || true
+
       - name: Summary
-        env:
-          KUBECONFIG: /tmp/kubeconfigs/mgmt.yaml
         run: |
           echo "=============================================="
           echo "  Super-Cluster GitOps pipeline done (ArgoCD)"
           echo "=============================================="
-          echo "  ArgoCD UI : http://${{ secrets.HOST }}:30080"
+          echo "  ArgoCD UI : http://localhost:30080 (or via tailnet 100.110.156.93:30080)"
           echo "  User      : admin"
           PASS=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' 2>/dev/null | base64 -d)
           echo "  Password  : ${PASS:-<run: kubectl -n argocd get secret argocd-initial-admin-secret>}"
